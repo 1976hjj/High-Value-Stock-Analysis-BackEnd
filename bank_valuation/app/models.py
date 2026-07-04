@@ -241,3 +241,84 @@ class BankMeanReversionOverviewResponse(BaseModel):
     results: list[BankMeanReversionRow]
     failures: list[dict[str, str]]
     data_note: str
+
+
+class StrategyBacktestQuery(BaseModel):
+    years: int = Field(default=10, ge=3, le=15)
+    start_date: date | None = None
+    end_date: date | None = None
+    rebalance_frequency: Literal["monthly", "quarterly", "semiannual", "annual"] = "quarterly"
+    holding_count: int = Field(default=10, ge=3, le=20)
+    min_dividend_yield: float = Field(default=0.03, ge=0, le=0.2)
+    min_dividend_safety: float = Field(default=55, ge=0, le=100)
+    min_stable_growth: float = Field(default=45, ge=0, le=100)
+    max_risk_score: float = Field(default=45, ge=0, le=100)
+    max_payout_ratio: float = Field(default=0.8, ge=0, le=1.5)
+    dividend_weight: float = Field(default=0.25, ge=0, le=1)
+    safety_weight: float = Field(default=0.25, ge=0, le=1)
+    growth_weight: float = Field(default=0.2, ge=0, le=1)
+    valuation_weight: float = Field(default=0.2, ge=0, le=1)
+    risk_penalty_weight: float = Field(default=0.15, ge=0, le=1)
+    initial_capital: float = Field(default=1.0, gt=0)
+    commission_rate: float = Field(default=0.0002, ge=0, le=0.01)
+    stamp_duty_rate: float = Field(default=0.0005, ge=0, le=0.02)
+    transfer_fee_rate: float = Field(default=0.00001, ge=0, le=0.01)
+    slippage_rate: float = Field(default=0.0001, ge=0, le=0.02)
+    cash_yield: float = Field(default=0.015, ge=0, le=0.1)
+
+
+class BacktestPoint(BaseModel):
+    date: date
+    value: float
+
+
+class BacktestYearReturn(BaseModel):
+    year: int
+    return_rate: float
+
+
+class BacktestHolding(BaseModel):
+    stock_code: str
+    stock_name: str
+    weight: float
+    score: float
+    dividend_yield: float
+    risk_score: float
+
+
+class BacktestMetrics(BaseModel):
+    total_return: float
+    annualized_return: float
+    max_drawdown: float
+    max_drawdown_date: date
+    recovery_date: date | None
+    recovery_days: int | None
+    volatility: float
+    sharpe: float | None
+    calmar: float | None
+    win_year_rate: float
+    annual_dividend_return: float
+    turnover: float
+    rebalance_count: int
+
+
+class StrategyBacktestResult(BaseModel):
+    strategy_id: Literal["income_core", "value_reversion", "defensive_rotation"]
+    strategy_name: str
+    description: str
+    metrics: BacktestMetrics
+    equity_curve: list[BacktestPoint]
+    drawdown_curve: list[BacktestPoint]
+    yearly_returns: list[BacktestYearReturn]
+    current_holdings: list[BacktestHolding]
+
+
+class StrategyBacktestResponse(BaseModel):
+    module: str
+    title: str
+    start_date: date
+    end_date: date
+    strategy_count: int
+    benchmark_note: str
+    data_note: str
+    results: list[StrategyBacktestResult]

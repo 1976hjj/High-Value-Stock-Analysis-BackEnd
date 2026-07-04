@@ -1,11 +1,12 @@
 from __future__ import annotations
 import logging
 from fastapi import APIRouter, HTTPException
-from ..models import BankInput, BatchValuationRequest, MonteCarloRequest, BankQuery, BatchBankQuery, SimpleMonteCarloRequest, BankMeanReversionQuery
+from ..models import BankInput, BatchValuationRequest, MonteCarloRequest, BankQuery, BatchBankQuery, SimpleMonteCarloRequest, BankMeanReversionQuery, StrategyBacktestQuery
 from ..valuation.service import value_bank
 from ..valuation.scenario import scenario_template
 from ..valuation.monte_carlo import run_monte_carlo
 from ..valuation.mean_reversion import bank_mean_reversion_overview
+from ..valuation.strategy_backtest import run_strategy_backtest
 from ..data_sources.bank_base import load_bank_input
 from ..data_sources.industry_benchmark import get_industry_benchmark
 
@@ -85,6 +86,24 @@ def mean_reversion_overview(query: BankMeanReversionQuery):
         return bank_mean_reversion_overview(query.valuation_date, query.refresh_cache, query.include_risky)
     except RuntimeError as exc:
         logger.exception("POST /mean-reversion-overview failed")
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/strategy-backtest")
+def strategy_backtest(query: StrategyBacktestQuery):
+    """Backtest dividend-oriented bank strategies from local cached histories."""
+    try:
+        logger.info(
+            "POST /strategy-backtest received: years=%s rebalance=%s holdings=%s start=%s end=%s",
+            query.years,
+            query.rebalance_frequency,
+            query.holding_count,
+            query.start_date,
+            query.end_date,
+        )
+        return run_strategy_backtest(query)
+    except RuntimeError as exc:
+        logger.exception("POST /strategy-backtest failed")
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 

@@ -27,3 +27,22 @@ def test_mean_reversion_overview_endpoint(monkeypatch):
     response = TestClient(app).post("/api/bank/mean-reversion-overview", json={"valuation_date": "2025-06-10"})
     assert response.status_code == 200
     assert response.json()["module"] == "bank_mean_reversion_overview"
+
+
+def test_strategy_backtest_endpoint(monkeypatch):
+    def fake_backtest(query):
+        return {
+            "module": "bank_strategy_backtest",
+            "title": "银行高股息策略回测",
+            "start_date": "2016-01-01",
+            "end_date": "2026-01-01",
+            "strategy_count": 0,
+            "benchmark_note": "test",
+            "data_note": "test",
+            "results": [],
+        }
+
+    monkeypatch.setattr("bank_valuation.app.routers.bank.run_strategy_backtest", fake_backtest)
+    response = TestClient(app).post("/api/bank/strategy-backtest", json={"years": 10})
+    assert response.status_code == 200
+    assert response.json()["module"] == "bank_strategy_backtest"
