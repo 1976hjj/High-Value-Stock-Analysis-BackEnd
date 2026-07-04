@@ -17,6 +17,7 @@ DEFAULT_BANK_ASSUMPTIONS = {
     "risk_free_rate": 0.02, "equity_risk_premium": 0.06, "beta": 0.8,
     "long_term_growth": 0.03,
 }
+DEFAULT_PAYOUT_RATIO = 0.4
 logger = logging.getLogger("bank_valuation.data")
 _BAOSTOCK_LOCK = threading.RLock()
 _CACHE_TTL_SECONDS = 120.0
@@ -135,7 +136,7 @@ def _write_disk_cache(requested_date: date, bank: BankInput) -> None:
     logger.info("Bank CSV cache written: snapshot=%s market=%s", snapshot, market)
 
 
-def _read_disk_cache(code: str, requested_date: date) -> BankInput | None:
+def _read_disk_cache(code: str, requested_date: date, allow_stale_current: bool = False) -> BankInput | None:
     snapshot, market = _snapshot_path(code), _market_path(code)
     if not snapshot.exists() or not market.exists():
         return None
@@ -146,7 +147,7 @@ def _read_disk_cache(code: str, requested_date: date) -> BankInput | None:
         if row is None:
             return None
         market_date = date.fromisoformat(row["market_date"])
-        if requested_date >= date.today() and market_date < requested_date:
+        if not allow_stale_current and requested_date >= date.today() and market_date < requested_date:
             logger.info(
                 "Bank CSV cache is stale for current/future request; will refresh: code=%s requested_date=%s cached_market_date=%s",
                 code, requested_date, market_date,
@@ -272,7 +273,7 @@ def _load_bank_input_once(stock_code: str, valuation_date: date | None = None) -
         report_month = date.fromisoformat(profit["statDate"]).month
         roe *= 12 / report_month
         dividend = _trailing_dividend(code, actual_date)
-        payout = min(1.0, dividend / eps) if eps > 0 and dividend > 0 else DEFAULT_BANK_ASSUMPTIONS["payout_ratio"]
+        payout = min(1.0, dividend / eps) if eps > 0 and dividend > 0 else DEFAULT_PAYOUT_RATIO
         name_rows = _rows(bs.query_stock_basic(code=code), "stock basic")
         name = BANK_NAMES.get(code) or (name_rows[0].get("code_name") if name_rows else code)
         result = BankInput(

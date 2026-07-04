@@ -90,6 +90,25 @@ class RiskAnalysis(BaseModel):
     market_conditions: list[str]
 
 
+class StressTestItem(BaseModel):
+    name: str
+    stressed_price: float | None
+    downside: float | None
+    severity: Literal["green", "yellow", "red"]
+    note: str
+
+
+class DefensiveDecision(BaseModel):
+    buy_wait_price: float
+    buy_wait_gap: float
+    buy_wait_status: Literal["reached", "near", "wait", "avoid"]
+    buy_wait_reason: str
+    risk_light: Literal["green", "yellow", "red"]
+    risk_light_label: str
+    risk_light_reasons: list[str]
+    stress_tests: list[StressTestItem]
+
+
 class BankProfile(BaseModel):
     bank_type: str
     brief: str
@@ -125,6 +144,7 @@ class ValuationResponse(BaseModel):
     margin_of_safety: float
     risk_flags: list[str]
     risk_analysis: RiskAnalysis
+    defensive_decision: DefensiveDecision
     final_rating: Literal["deep_value", "watch", "hold_income", "value_trap_risk", "avoid"]
 
 
@@ -164,4 +184,60 @@ class IndustryBenchmarkResponse(BaseModel):
     as_of_date: date
     sample_size: int
     metrics: dict[str, IndustryMetric]
+    data_note: str
+
+
+class BankMeanReversionQuery(BaseModel):
+    """Request for the all-bank undervaluation and mean-reversion overview."""
+    valuation_date: date | None = Field(default=None, description="估值日期；留空时使用最近可获得交易日")
+    refresh_cache: bool = Field(default=False, description="为 true 时强制刷新本地缓存")
+    include_risky: bool = Field(default=True, description="是否在结果中保留经营风险型低估银行")
+
+
+class BankMeanReversionRow(BaseModel):
+    rank: int
+    stock_code: str
+    stock_name: str
+    bank_profile: BankProfile
+    market_date: date | None = None
+    current_price: float
+    current_pb: float
+    pb_percentile_5y: float
+    pb_discount_to_5y_median: float
+    mean_reversion_upside: float
+    upside_potential: float
+    margin_of_safety: float
+    dividend_yield: float
+    roe: float
+    profit_growth_yoy: float
+    npl_ratio: float | None = None
+    provision_coverage: float | None = None
+    cet1_ratio: float | None = None
+    quality_score: float
+    risk_score: float
+    mean_reversion_score: float
+    reversion_probability: float
+    dividend_safety_score: float
+    stable_growth_score: float
+    income_candidate_score: float
+    income_status: Literal["core_income", "income_watch", "yield_trap_risk", "not_income_candidate"]
+    status: Literal["high_conviction_reversion", "undervalued_watch", "fair_value", "risk_discount", "overvalued"]
+    tags: list[str]
+    income_tags: list[str]
+    risk_flags: list[str]
+    thesis: str
+
+
+class BankMeanReversionOverviewResponse(BaseModel):
+    module: str
+    title: str
+    as_of_date: date | None = None
+    count: int
+    investable_count: int
+    income_candidate_count: int
+    yield_trap_count: int
+    risky_count: int
+    failed_count: int
+    results: list[BankMeanReversionRow]
+    failures: list[dict[str, str]]
     data_note: str

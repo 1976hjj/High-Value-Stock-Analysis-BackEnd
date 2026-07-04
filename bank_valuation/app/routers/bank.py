@@ -1,10 +1,11 @@
 from __future__ import annotations
 import logging
 from fastapi import APIRouter, HTTPException
-from ..models import BankInput, BatchValuationRequest, MonteCarloRequest, BankQuery, BatchBankQuery, SimpleMonteCarloRequest
+from ..models import BankInput, BatchValuationRequest, MonteCarloRequest, BankQuery, BatchBankQuery, SimpleMonteCarloRequest, BankMeanReversionQuery
 from ..valuation.service import value_bank
 from ..valuation.scenario import scenario_template
 from ..valuation.monte_carlo import run_monte_carlo
+from ..valuation.mean_reversion import bank_mean_reversion_overview
 from ..data_sources.bank_base import load_bank_input
 from ..data_sources.industry_benchmark import get_industry_benchmark
 
@@ -69,6 +70,21 @@ def industry_benchmark(query: BankQuery):
         return get_industry_benchmark(bank)
     except (ValueError, RuntimeError) as exc:
         logger.exception("POST /industry-benchmark failed: stock_code=%s", query.stock_code)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/mean-reversion-overview")
+def mean_reversion_overview(query: BankMeanReversionQuery):
+    """All A-share bank undervaluation table for the sidebar overview module."""
+    try:
+        logger.info(
+            "POST /mean-reversion-overview received: valuation_date=%s include_risky=%s",
+            query.valuation_date,
+            query.include_risky,
+        )
+        return bank_mean_reversion_overview(query.valuation_date, query.refresh_cache, query.include_risky)
+    except RuntimeError as exc:
+        logger.exception("POST /mean-reversion-overview failed")
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 

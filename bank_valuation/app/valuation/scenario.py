@@ -70,7 +70,8 @@ def _current_fit(name: str, bank: BankInput) -> dict[str, list[str] | str]:
     else:
         supporting = []
         gaps = []
-        (supporting if bank.cet1_ratio < .085 else gaps).append("资本缓冲偏紧" if bank.cet1_ratio < .085 else "当前CET1仍高于8.5%缓冲线")
+        cet1_tight = bank.cet1_ratio is not None and bank.cet1_ratio < .085
+        (supporting if cet1_tight else gaps).append("资本缓冲偏紧" if cet1_tight else "当前CET1未见低于8.5%缓冲线")
         (supporting if bank.roe < .04 else gaps).append("ROE已跌至危机区间" if bank.roe < .04 else "需警惕ROE快速降至4%以下")
         (supporting if bank.npl_ratio_change > 0 and bank.provision_coverage_change < 0 else gaps).append("资产质量与拨备同时恶化" if bank.npl_ratio_change > 0 and bank.provision_coverage_change < 0 else "需警惕不良上升叠加拨备下降")
     return {"assessment": "当前已有部分信号" if supporting else "当前尚未满足核心条件", "supporting_signals": supporting, "gaps_or_watchpoints": gaps}
