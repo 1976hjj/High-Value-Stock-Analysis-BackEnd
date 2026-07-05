@@ -10,6 +10,7 @@ import statistics
 from ..data_sources.bank_base import BANK_NAMES, _market_path
 from ..models import (
     BacktestHolding,
+    BacktestHoldingSnapshot,
     BacktestMetrics,
     BacktestPoint,
     BacktestYearReturn,
@@ -84,18 +85,20 @@ def run_strategy_backtest(query: StrategyBacktestQuery) -> StrategyBacktestRespo
         _run_one_strategy(strategy_id, config, data, dates, query)
         for strategy_id, config in STRATEGIES.items()
     ]
+    benchmark_curve = _bank_equal_weight_benchmark(data, dates, query.initial_capital)
     return StrategyBacktestResponse(
         module="bank_strategy_backtest",
         title="银行高股息策略回测",
         start_date=dates[0],
         end_date=dates[-1],
         strategy_count=len(results),
-        benchmark_note="当前版本重点比较三套银行内部策略，暂未接入银行指数或沪深300基准。",
+        benchmark_note="银行股等权价格基准：使用本地银行股日线缓存按每日可用涨跌幅等权滚动，不含股息和交易成本。",
         data_note=(
             "v1 回测使用本地缓存中的日线价格/PB历史，股息收益按当前每股分红折算为日度收益；"
             "财务质量、资产质量和资本风险使用最近已披露快照做过滤。它适合先比较策略框架，"
             "严格无未来函数版本需要补齐历史财报公告日、历史分红和历史监管指标。"
         ),
+        benchmark_curve=_sample_curve(benchmark_curve),
         results=results,
     )
 
@@ -131,6 +134,32 @@ def _read_market_history(code: str) -> dict[date, MarketPoint]:
     return output
 
 
+def _bank_equal_weight_benchmark(
+    data: dict[str, BankBacktestData],
+    dates: list[date],
+    initial_value: float,
+) -> list[BacktestPoint]:
+    value = initial_value
+    previous_prices: dict[str, float] = {}
+    curve: list[BacktestPoint] = []
+
+    for day in dates:
+        daily_returns: list[float] = []
+        for code, item in data.items():
+            point = item.market.get(day)
+            if point is None:
+                continue
+            previous = previous_prices.get(code)
+            if previous is not None and previous > 0:
+                daily_returns.append(point.close / previous - 1)
+            previous_prices[code] = point.close
+        if daily_returns:
+            value *= 1 + sum(daily_returns) / len(daily_returns)
+        curve.append(BacktestPoint(date=day, value=round(value, 6)))
+
+    return curve
+
+
 def _run_one_strategy(
     strategy_id: str,
     config: dict[str, object],
@@ -143,30 +172,18 @@ def _run_one_strategy(
     previous_prices: dict[str, float] = {}
     equity: list[BacktestPoint] = []
     drawdown: list[BacktestPoint] = []
+    transaction_cost_curve: list[BacktestPoint] = []
     daily_returns: list[float] = []
     peak = portfolio_value
     total_turnover = 0.0
+    total_transaction_cost = 0.0
     dividend_gain = 0.0
     rebalance_count = 0
     next_rebalance: date | None = None
     latest_candidates: list[Candidate] = []
+    holding_snapshots: list[BacktestHoldingSnapshot] = []
 
     for day in dates:
-        if next_rebalance is None or day >= next_rebalance:
-            latest_candidates = _rank_candidates(strategy_id, data, day, query)
-            new_weights = _target_weights(strategy_id, latest_candidates, query.holding_count)
-            turnover = sum(abs(new_weights.get(code, 0.0) - weights.get(code, 0.0)) for code in set(new_weights) | set(weights))
-            sell_turnover = sum(max(weights.get(code, 0.0) - new_weights.get(code, 0.0), 0.0) for code in set(new_weights) | set(weights))
-            cost = (
-                turnover * (query.commission_rate + query.slippage_rate + query.transfer_fee_rate)
-                + sell_turnover * query.stamp_duty_rate
-            )
-            portfolio_value *= max(0.0, 1 - cost)
-            total_turnover += turnover
-            weights = new_weights
-            rebalance_count += 1
-            next_rebalance = _advance_rebalance(day, query.rebalance_frequency)
-
         day_return = 0.0
         day_dividend = 0.0
         invested_weight = sum(weights.values())
@@ -187,9 +204,41 @@ def _run_one_strategy(
         portfolio_value *= 1 + day_return
         dividend_gain += day_dividend
         daily_returns.append(day_return)
+
+        if next_rebalance is None or day >= next_rebalance:
+            latest_candidates = _rank_candidates(strategy_id, data, day, query)
+            new_weights = _target_weights(strategy_id, latest_candidates, query.holding_count)
+            turnover = sum(abs(new_weights.get(code, 0.0) - weights.get(code, 0.0)) for code in set(new_weights) | set(weights))
+            sell_turnover = sum(max(weights.get(code, 0.0) - new_weights.get(code, 0.0), 0.0) for code in set(new_weights) | set(weights))
+            cost = (
+                turnover * (query.commission_rate + query.slippage_rate + query.transfer_fee_rate)
+                + sell_turnover * query.stamp_duty_rate
+            )
+            cost_amount = portfolio_value * cost
+            portfolio_value *= max(0.0, 1 - cost)
+            total_transaction_cost += cost_amount
+            total_turnover += turnover
+            weights = new_weights
+            for code in list(previous_prices):
+                if code not in weights:
+                    del previous_prices[code]
+            for code in weights:
+                point = data[code].market.get(day)
+                if point is not None:
+                    previous_prices[code] = point.close
+            holding_snapshots.append(
+                BacktestHoldingSnapshot(
+                    date=day,
+                    holdings=_holdings_from_candidates(latest_candidates, weights),
+                )
+            )
+            rebalance_count += 1
+            next_rebalance = _advance_rebalance(day, query.rebalance_frequency)
+
         peak = max(peak, portfolio_value)
         equity.append(BacktestPoint(date=day, value=round(portfolio_value, 6)))
         drawdown.append(BacktestPoint(date=day, value=round(portfolio_value / peak - 1, 6)))
+        transaction_cost_curve.append(BacktestPoint(date=day, value=round(total_transaction_cost, 6)))
 
     metrics = _metrics(
         equity=equity,
@@ -198,10 +247,27 @@ def _run_one_strategy(
         cash_yield=query.cash_yield,
         dividend_gain=dividend_gain,
         total_turnover=total_turnover,
+        total_transaction_cost=total_transaction_cost,
         rebalance_count=rebalance_count,
     )
     yearly = _yearly_returns(equity)
-    holdings = [
+    holdings = _holdings_from_candidates(latest_candidates, weights)
+    return StrategyBacktestResult(
+        strategy_id=strategy_id,  # type: ignore[arg-type]
+        strategy_name=str(config["name"]),
+        description=str(config["description"]),
+        metrics=metrics,
+        equity_curve=_sample_curve(equity),
+        drawdown_curve=_sample_curve(drawdown, required_dates={metrics.max_drawdown_date}),
+        transaction_cost_curve=_sample_curve(transaction_cost_curve),
+        yearly_returns=yearly,
+        current_holdings=holdings,
+        holding_snapshots=holding_snapshots,
+    )
+
+
+def _holdings_from_candidates(candidates: list[Candidate], weights: dict[str, float]) -> list[BacktestHolding]:
+    return [
         BacktestHolding(
             stock_code=item.code,
             stock_name=item.name,
@@ -210,19 +276,9 @@ def _run_one_strategy(
             dividend_yield=round(item.dividend_yield, 6),
             risk_score=round(item.risk_score, 2),
         )
-        for item in latest_candidates
+        for item in candidates
         if weights.get(item.code, 0.0) > 0
     ]
-    return StrategyBacktestResult(
-        strategy_id=strategy_id,  # type: ignore[arg-type]
-        strategy_name=str(config["name"]),
-        description=str(config["description"]),
-        metrics=metrics,
-        equity_curve=_sample_curve(equity),
-        drawdown_curve=_sample_curve(drawdown, required_dates={metrics.max_drawdown_date}),
-        yearly_returns=yearly,
-        current_holdings=holdings,
-    )
 
 
 def _rank_candidates(
@@ -343,6 +399,7 @@ def _metrics(
     cash_yield: float,
     dividend_gain: float,
     total_turnover: float,
+    total_transaction_cost: float,
     rebalance_count: int,
 ) -> BacktestMetrics:
     start_value = equity[0].value
@@ -382,6 +439,7 @@ def _metrics(
         annual_dividend_return=round(annual_dividend, 6),
         turnover=round(total_turnover, 6),
         rebalance_count=rebalance_count,
+        total_transaction_cost=round(total_transaction_cost, 2),
     )
 
 

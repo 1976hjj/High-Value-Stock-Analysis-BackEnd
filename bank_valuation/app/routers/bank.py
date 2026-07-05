@@ -107,6 +107,20 @@ def strategy_backtest(query: StrategyBacktestQuery):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@router.post("/strategy-backtest/prepare")
+def prepare_strategy_backtest_cache(query: BankMeanReversionQuery):
+    """Refresh local bank snapshots used by the strategy backtest."""
+    try:
+        logger.info(
+            "POST /strategy-backtest/prepare received: valuation_date=%s",
+            query.valuation_date,
+        )
+        return bank_mean_reversion_overview(query.valuation_date, refresh_cache=True, include_risky=True)
+    except RuntimeError as exc:
+        logger.exception("POST /strategy-backtest/prepare failed")
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @router.post("/monte-carlo")
 def monte_carlo(payload: SimpleMonteCarloRequest):
     try:

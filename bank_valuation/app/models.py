@@ -286,6 +286,11 @@ class BacktestHolding(BaseModel):
     risk_score: float
 
 
+class BacktestHoldingSnapshot(BaseModel):
+    date: date
+    holdings: list[BacktestHolding]
+
+
 class BacktestMetrics(BaseModel):
     total_return: float
     annualized_return: float
@@ -300,6 +305,7 @@ class BacktestMetrics(BaseModel):
     annual_dividend_return: float
     turnover: float
     rebalance_count: int
+    total_transaction_cost: float = 0.0
 
 
 class StrategyBacktestResult(BaseModel):
@@ -309,8 +315,10 @@ class StrategyBacktestResult(BaseModel):
     metrics: BacktestMetrics
     equity_curve: list[BacktestPoint]
     drawdown_curve: list[BacktestPoint]
+    transaction_cost_curve: list[BacktestPoint] = Field(default_factory=list)
     yearly_returns: list[BacktestYearReturn]
     current_holdings: list[BacktestHolding]
+    holding_snapshots: list[BacktestHoldingSnapshot] = Field(default_factory=list)
 
 
 class StrategyBacktestResponse(BaseModel):
@@ -321,4 +329,5 @@ class StrategyBacktestResponse(BaseModel):
     strategy_count: int
     benchmark_note: str
     data_note: str
+    benchmark_curve: list[BacktestPoint] = Field(default_factory=list)
     results: list[StrategyBacktestResult]
