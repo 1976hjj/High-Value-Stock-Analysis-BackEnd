@@ -25,11 +25,7 @@ def bank_mean_reversion_overview(
     requested_date = valuation_date or date.today()
     for code in BANK_NAMES:
         try:
-            bank = (
-                load_bank_input(code, valuation_date, refresh_cache)
-                if refresh_cache
-                else _load_latest_cached_bank(code, requested_date)
-            )
+            bank = _load_overview_bank(code, valuation_date, requested_date, refresh_cache)
             valuation = value_bank(bank)
             rows.append(_build_row(bank, valuation))
         except RuntimeError as exc:
@@ -68,6 +64,23 @@ def bank_mean_reversion_overview(
             "需要逐家联网刷新时传入 refresh_cache=true。"
         ),
     )
+
+
+def _load_overview_bank(
+    code: str,
+    valuation_date: date | None,
+    requested_date: date,
+    refresh_cache: bool,
+) -> BankInput:
+    if refresh_cache:
+        return load_bank_input(code, valuation_date, refresh_cache=True)
+    try:
+        return _load_latest_cached_bank(code, requested_date)
+    except RuntimeError as exc:
+        if "缓存缺失" not in str(exc):
+            raise
+        logger.info("Overview cache missing; refreshing one bank: code=%s requested_date=%s", code, requested_date)
+        return load_bank_input(code, requested_date, refresh_cache=True)
 
 
 def _load_latest_cached_bank(code: str, requested_date: date) -> BankInput:

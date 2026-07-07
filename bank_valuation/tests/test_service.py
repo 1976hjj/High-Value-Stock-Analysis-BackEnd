@@ -2,7 +2,10 @@ from bank_valuation.app.valuation.service import value_bank
 from bank_valuation.app.valuation import mean_reversion
 from bank_valuation.app.data_sources import bank_base
 from datetime import date
+import sys
 from types import SimpleNamespace
+
+import pandas as pd
 
 
 def test_full_result_contains_auditable_inputs_and_all_rim_horizons(bank):
@@ -82,6 +85,7 @@ def test_trailing_dividend_deduplicates_same_cash_event(monkeypatch):
         "dividend 2024": [],
     }
 
+    monkeypatch.setattr(bank_base, "_latest_fiscal_year_dividend", lambda code, as_of: None)
     monkeypatch.setattr(bank_base, "bs", SimpleNamespace(query_dividend_data=lambda **kwargs: object()))
     monkeypatch.setattr(bank_base, "_rows", lambda query, source: rows_by_year[source])
 
@@ -109,10 +113,46 @@ def test_trailing_dividend_keeps_distinct_real_events(monkeypatch):
         "dividend 2024": [],
     }
 
+    monkeypatch.setattr(bank_base, "_latest_fiscal_year_dividend", lambda code, as_of: None)
     monkeypatch.setattr(bank_base, "bs", SimpleNamespace(query_dividend_data=lambda **kwargs: object()))
     monkeypatch.setattr(bank_base, "_rows", lambda query, source: rows_by_year[source])
 
     assert bank_base._trailing_dividend("sh.600036", date(2026, 7, 7)) == 3.0
+
+
+def test_latest_fiscal_year_dividend_sums_interim_and_annual(monkeypatch):
+    frame = pd.DataFrame(
+        [
+            [date(2024, 12, 31), date(2025, 4, 26), None, None, None, 4.2],
+            [date(2025, 6, 30), date(2025, 8, 30), None, None, None, 2.0],
+            [date(2025, 12, 31), date(2026, 4, 29), None, None, None, 2.3],
+        ],
+        columns=["report_date", "announcement_date", "a", "b", "c", "cash_per_10"],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "akshare",
+        SimpleNamespace(stock_fhps_detail_em=lambda symbol: frame),
+    )
+
+    assert bank_base._latest_fiscal_year_dividend("sh.601577", date(2026, 7, 7)) == 0.43
+
+
+def test_latest_fiscal_year_dividend_ignores_future_announcements(monkeypatch):
+    frame = pd.DataFrame(
+        [
+            [date(2025, 6, 30), date(2025, 8, 30), None, None, None, 2.0],
+            [date(2025, 12, 31), date(2026, 8, 1), None, None, None, 2.3],
+        ],
+        columns=["report_date", "announcement_date", "a", "b", "c", "cash_per_10"],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "akshare",
+        SimpleNamespace(stock_fhps_detail_em=lambda symbol: frame),
+    )
+
+    assert bank_base._latest_fiscal_year_dividend("sh.601577", date(2026, 7, 7)) == 0.2
 
 
 def test_mean_reversion_overview_ranks_healthy_cheap_bank_above_risky_discount(monkeypatch, bank):
@@ -173,3 +213,32 @@ def test_mean_reversion_overview_can_hide_risky_rows(monkeypatch, bank):
 
     assert overview.results == []
     assert overview.risky_count == 1
+
+
+def test_mean_reversion_overview_refreshes_missing_cached_bank(monkeypatch, bank):
+    missing = bank.model_copy(update={
+        "stock_code": "sh.600908",
+        "current_price": 6.0,
+        "bps": 10.0,
+        "pb_current": .60,
+        "pb_history": [.60 for _ in range(800)],
+    })
+
+    def fake_cached(code, requested_date):
+        raise RuntimeError("本地缓存缺失；请先单独分析该银行或使用 refresh_cache=true 刷新")
+
+    calls = []
+
+    def fake_live(code, valuation_date, refresh_cache):
+        calls.append((code, valuation_date, refresh_cache))
+        return missing
+
+    monkeypatch.setattr(mean_reversion, "BANK_NAMES", {"sh.600908": "无锡银行"})
+    monkeypatch.setattr(mean_reversion, "_load_latest_cached_bank", fake_cached)
+    monkeypatch.setattr(mean_reversion, "load_bank_input", fake_live)
+
+    overview = mean_reversion.bank_mean_reversion_overview(date(2026, 7, 7), refresh_cache=False)
+
+    assert overview.failed_count == 0
+    assert overview.count == 1
+    assert calls == [("sh.600908", date(2026, 7, 7), True)]

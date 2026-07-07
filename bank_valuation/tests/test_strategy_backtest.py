@@ -36,6 +36,10 @@ def _market(prices: dict[date, float]) -> dict[date, backtest.MarketPoint]:
     return {day: backtest.MarketPoint(close=price, pb=1.0) for day, price in prices.items()}
 
 
+def _data(code: str, prices: dict[date, float], dividends=None) -> backtest.BankBacktestData:
+    return backtest.BankBacktestData(_bank(code), _market(prices), dividends or [])
+
+
 def _query(**overrides) -> StrategyBacktestQuery:
     values = {
         "years": 3,
@@ -72,9 +76,9 @@ def _result(data, query, monkeypatch, rank_by_date):
 def test_held_price_change_is_counted(monkeypatch):
     days = [date(2025, 1, 1), date(2025, 1, 2)]
     data = {
-        "A": backtest.BankBacktestData(_bank("A"), _market({days[0]: 10.0, days[1]: 11.0})),
-        "B": backtest.BankBacktestData(_bank("B"), _market({days[0]: 10.0, days[1]: 10.0})),
-        "C": backtest.BankBacktestData(_bank("C"), _market({days[0]: 10.0, days[1]: 10.0})),
+        "A": _data("A", {days[0]: 10.0, days[1]: 11.0}),
+        "B": _data("B", {days[0]: 10.0, days[1]: 10.0}),
+        "C": _data("C", {days[0]: 10.0, days[1]: 10.0}),
     }
     ranks = {day: ["A", "B", "C"] for day in days}
 
@@ -94,22 +98,20 @@ def test_reentered_holding_does_not_capture_gain_while_out_of_portfolio(monkeypa
     ]
     flat = {day: 10.0 for day in days}
     data = {
-        "A": backtest.BankBacktestData(
-            _bank("A"),
-            _market(
-                {
-                    days[0]: 10.0,
-                    days[1]: 10.0,
-                    days[2]: 10.0,
-                    days[3]: 100.0,
-                    days[4]: 100.0,
-                    days[5]: 100.0,
-                }
-            ),
+        "A": _data(
+            "A",
+            {
+                days[0]: 10.0,
+                days[1]: 10.0,
+                days[2]: 10.0,
+                days[3]: 100.0,
+                days[4]: 100.0,
+                days[5]: 100.0,
+            },
         ),
-        "B": backtest.BankBacktestData(_bank("B"), _market(flat)),
-        "C": backtest.BankBacktestData(_bank("C"), _market(flat)),
-        "D": backtest.BankBacktestData(_bank("D"), _market(flat)),
+        "B": _data("B", flat),
+        "C": _data("C", flat),
+        "D": _data("D", flat),
     }
     ranks = {
         days[0]: ["A", "B", "C", "D"],
@@ -129,7 +131,7 @@ def test_reentered_holding_does_not_capture_gain_while_out_of_portfolio(monkeypa
 def test_rebalance_cost_is_applied_to_portfolio_value_and_reported(monkeypatch):
     day = date(2025, 1, 1)
     data = {
-        code: backtest.BankBacktestData(_bank(code), _market({day: 10.0}))
+        code: _data(code, {day: 10.0})
         for code in ["A", "B", "C"]
     }
     ranks = {day: ["A", "B", "C"]}
@@ -146,13 +148,36 @@ def test_bank_equal_weight_benchmark_averages_daily_returns():
         "A": backtest.BankBacktestData(
             _bank("A"),
             _market({days[0]: 10.0, days[1]: 11.0, days[2]: 12.1}),
+            [],
         ),
         "B": backtest.BankBacktestData(
             _bank("B"),
             _market({days[0]: 10.0, days[1]: 9.0, days[2]: 9.9}),
+            [],
         ),
     }
 
     curve = backtest._bank_equal_weight_benchmark(data, days, 100.0)
 
     assert [point.value for point in curve] == [100.0, 100.0, 110.0]
+
+
+def test_cash_dividend_is_counted_only_on_ex_dividend_date(monkeypatch):
+    days = [date(2025, 1, 1), date(2025, 1, 2), date(2025, 1, 3)]
+    dividend = backtest.DividendEvent(
+        report_date=date(2024, 12, 31),
+        announcement_date=date(2024, 12, 20),
+        ex_dividend_date=days[1],
+        cash_per_share=1.0,
+    )
+    data = {
+        "A": _data("A", {day: 10.0 for day in days}, [dividend]),
+        "B": _data("B", {day: 10.0 for day in days}),
+        "C": _data("C", {day: 10.0 for day in days}),
+    }
+    ranks = {day: ["A", "B", "C"] for day in days}
+
+    result = _result(data, _query(), monkeypatch, ranks)
+
+    assert result.equity_curve[-1].value == 103.333333
+    assert result.metrics.annual_dividend_return > 0

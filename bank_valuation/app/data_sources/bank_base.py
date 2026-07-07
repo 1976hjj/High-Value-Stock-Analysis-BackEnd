@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 import csv
 import logging
+import math
 from pathlib import Path
 import threading
 import time
@@ -92,6 +93,10 @@ def _optional_float(row: dict[str, str], key: str) -> float | None:
 
 def _cache_stem(code: str) -> str:
     return code.replace(".", "_")
+
+
+def _akshare_symbol(code: str) -> str:
+    return normalize_code(code).split(".")[1]
 
 
 def _snapshot_path(code: str) -> Path:
@@ -278,7 +283,73 @@ def _dividend_event_key(
     return report_year, is_annual, event_date.isoformat(), round(cash, 8)
 
 
+def _coerce_date(value) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value
+    try:
+        if math.isnan(value):
+            return None
+    except TypeError:
+        pass
+    try:
+        parsed = date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+    return parsed
+
+
+def _coerce_positive_float(value) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if math.isnan(number) or number <= 0:
+        return 0.0
+    return number
+
+
+def _latest_fiscal_year_dividend(code: str, as_of: date) -> float | None:
+    try:
+        import akshare as ak
+
+        frame = ak.stock_fhps_detail_em(symbol=_akshare_symbol(code))
+    except Exception:
+        logger.warning("AKShare dividend detail unavailable; fallback to Baostock: code=%s as_of=%s", code, as_of, exc_info=True)
+        return None
+    if frame is None or frame.empty or len(frame.columns) < 6:
+        return None
+
+    report_col, announcement_col, cash_col = frame.columns[0], frame.columns[1], frame.columns[5]
+    yearly_cash: dict[int, float] = {}
+    for _, row in frame.iterrows():
+        report_date = _coerce_date(row.get(report_col))
+        announcement_date = _coerce_date(row.get(announcement_col))
+        cash_per_10 = _coerce_positive_float(row.get(cash_col))
+        if report_date is None or announcement_date is None or announcement_date > as_of or cash_per_10 <= 0:
+            continue
+        yearly_cash[report_date.year] = yearly_cash.get(report_date.year, 0.0) + cash_per_10 / 10
+    if not yearly_cash:
+        return None
+
+    latest_year = max(yearly_cash)
+    dividend = yearly_cash[latest_year]
+    logger.info(
+        "Latest fiscal-year cash dividend: code=%s as_of=%s report_year=%s dividend_per_share=%.6f source=AKShare/Eastmoney",
+        code,
+        as_of,
+        latest_year,
+        dividend,
+    )
+    return dividend
+
+
 def _trailing_dividend(code: str, as_of: date) -> float:
+    latest_dividend = _latest_fiscal_year_dividend(code, as_of)
+    if latest_dividend is not None:
+        return latest_dividend
+
     events: list[tuple[int | None, bool, date, float, bool]] = []
     seen: set[tuple[int | None, bool, str, float]] = set()
     window_start = as_of - timedelta(days=DIVIDEND_LOOKBACK_DAYS)

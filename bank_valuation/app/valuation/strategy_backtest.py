@@ -7,7 +7,7 @@ import csv
 import math
 import statistics
 
-from ..data_sources.bank_base import BANK_NAMES, _market_path
+from ..data_sources.bank_base import BANK_NAMES, _akshare_symbol, _coerce_date, _coerce_positive_float, _market_path
 from ..models import (
     BacktestHolding,
     BacktestHoldingSnapshot,
@@ -39,6 +39,15 @@ class MarketPoint:
 class BankBacktestData:
     bank: BankInput
     market: dict[date, MarketPoint]
+    dividends: list["DividendEvent"]
+
+
+@dataclass
+class DividendEvent:
+    report_date: date
+    announcement_date: date
+    ex_dividend_date: date | None
+    cash_per_share: float
 
 
 @dataclass
@@ -110,11 +119,48 @@ def _load_backtest_data() -> dict[str, BankBacktestData]:
         try:
             bank = _load_latest_cached_bank(code, requested_date)
             market = _read_market_history(code)
+            dividends = _read_dividend_events(code)
         except Exception:
             continue
         if len(market) >= 252:
-            output[code] = BankBacktestData(bank=bank, market=market)
+            output[code] = BankBacktestData(bank=bank, market=market, dividends=dividends)
     return output
+
+
+def _read_dividend_events(code: str) -> list[DividendEvent]:
+    try:
+        import akshare as ak
+
+        frame = ak.stock_fhps_detail_em(symbol=_akshare_symbol(code))
+    except Exception:
+        return []
+    if frame is None or frame.empty or len(frame.columns) < 17:
+        return []
+
+    report_col, announcement_col, cash_col, ex_date_col = frame.columns[0], frame.columns[1], frame.columns[5], frame.columns[16]
+    events: list[DividendEvent] = []
+    seen: set[tuple[date, date | None, float]] = set()
+    for _, row in frame.iterrows():
+        report_date = _coerce_date(row.get(report_col))
+        announcement_date = _coerce_date(row.get(announcement_col))
+        ex_dividend_date = _coerce_date(row.get(ex_date_col))
+        cash_per_10 = _coerce_positive_float(row.get(cash_col))
+        if report_date is None or announcement_date is None or cash_per_10 <= 0:
+            continue
+        cash_per_share = cash_per_10 / 10
+        event_key = (report_date, ex_dividend_date, round(cash_per_share, 8))
+        if event_key in seen:
+            continue
+        seen.add(event_key)
+        events.append(
+            DividendEvent(
+                report_date=report_date,
+                announcement_date=announcement_date,
+                ex_dividend_date=ex_dividend_date,
+                cash_per_share=cash_per_share,
+            )
+        )
+    return sorted(events, key=lambda event: (event.announcement_date, event.report_date))
 
 
 def _read_market_history(code: str) -> dict[date, MarketPoint]:
@@ -194,8 +240,8 @@ def _run_one_strategy(
             previous = previous_prices.get(code, point.close)
             if previous > 0:
                 day_return += weight * (point.close / previous - 1)
-            dividend_yield = _historical_dividend_yield(data[code].bank, point.close)
-            dividend_part = weight * dividend_yield / 252
+            dividend_cash = _cash_dividend_on_day(data[code], day)
+            dividend_part = weight * dividend_cash / previous if previous > 0 else 0.0
             day_return += dividend_part
             day_dividend += dividend_part
             previous_prices[code] = point.close
@@ -297,7 +343,7 @@ def _rank_candidates(
         safety = _dividend_safety_score(bank, risk)
         stable = _stable_growth_score(bank, risk)
         quality = _quality_score(bank)
-        dividend_yield = _historical_dividend_yield(bank, point.close)
+        dividend_yield = _historical_dividend_yield(item, point.close, day)
         pb_percentile = _pb_percentile(item.market, day, point.pb, years=5)
         median_pb = _median_pb_until(item.market, day, years=5)
         reversion = max(0.0, median_pb / point.pb - 1) if point.pb > 0 and median_pb > 0 else 0.0
@@ -362,10 +408,31 @@ def _target_weights(strategy_id: str, candidates: list[Candidate], target_count:
     return {item.code: invested * raw[index] / total for index, item in enumerate(selected)}
 
 
-def _historical_dividend_yield(bank: BankInput, price: float) -> float:
-    if price <= 0 or bank.dividend_per_share <= 0:
+def _historical_dividend_yield(item: BankBacktestData, price: float, day: date) -> float:
+    if price <= 0:
         return 0.0
-    return min(bank.dividend_per_share / price, 0.15)
+    dividend_per_share = _announced_fiscal_year_dividend(item, day)
+    if dividend_per_share <= 0:
+        dividend_per_share = item.bank.dividend_per_share
+    return min(dividend_per_share / price, 0.15)
+
+
+def _announced_fiscal_year_dividend(item: BankBacktestData, day: date) -> float:
+    yearly_cash: dict[int, float] = {}
+    for event in item.dividends:
+        if event.announcement_date <= day:
+            yearly_cash[event.report_date.year] = yearly_cash.get(event.report_date.year, 0.0) + event.cash_per_share
+    if not yearly_cash:
+        return 0.0
+    return yearly_cash[max(yearly_cash)]
+
+
+def _cash_dividend_on_day(item: BankBacktestData, day: date) -> float:
+    return sum(
+        event.cash_per_share
+        for event in item.dividends
+        if event.ex_dividend_date == day and event.announcement_date <= day
+    )
 
 
 def _pb_percentile(market: dict[date, MarketPoint], day: date, current_pb: float, years: int) -> float:
