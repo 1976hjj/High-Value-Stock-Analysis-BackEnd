@@ -277,6 +277,8 @@ def _run_one_strategy(
     portfolio_value = query.initial_capital
     weights: dict[str, float] = {}
     previous_prices: dict[str, float] = {}
+    entry_dates: dict[str, date] = {}
+    position_profits: dict[str, float] = {}
     equity: list[BacktestPoint] = []
     drawdown: list[BacktestPoint] = []
     transaction_cost_curve: list[BacktestPoint] = []
@@ -293,18 +295,22 @@ def _run_one_strategy(
     for day in dates:
         day_return = 0.0
         day_dividend = 0.0
+        value_before_day = portfolio_value
         invested_weight = sum(weights.values())
         for code, weight in weights.items():
             point = data[code].market.get(day)
             if point is None:
                 continue
+            position_return = 0.0
             previous = previous_prices.get(code, point.close)
             if previous > 0:
-                day_return += weight * (point.close / previous - 1)
+                position_return += weight * (point.close / previous - 1)
             dividend_cash = _cash_dividend_on_day(data[code], day)
             dividend_part = weight * dividend_cash / previous if previous > 0 else 0.0
-            day_return += dividend_part
+            position_return += dividend_part
+            day_return += position_return
             day_dividend += dividend_part
+            position_profits[code] = position_profits.get(code, 0.0) + value_before_day * position_return
             previous_prices[code] = point.close
         cash_weight = max(0.0, 1 - invested_weight)
         day_return += cash_weight * query.cash_yield / 252
@@ -329,16 +335,17 @@ def _run_one_strategy(
             for code in list(previous_prices):
                 if code not in weights:
                     del previous_prices[code]
+            for code in list(entry_dates):
+                if code not in weights:
+                    del entry_dates[code]
+                    position_profits.pop(code, None)
             for code in weights:
+                if code not in entry_dates:
+                    entry_dates[code] = day
+                    position_profits[code] = 0.0
                 point = data[code].market.get(day)
                 if point is not None:
                     previous_prices[code] = point.close
-            holding_snapshots.append(
-                BacktestHoldingSnapshot(
-                    date=day,
-                    holdings=_holdings_from_candidates(latest_candidates, weights),
-                )
-            )
             rebalance_count += 1
             next_rebalance = _advance_rebalance(day, query.rebalance_frequency)
 
@@ -346,6 +353,13 @@ def _run_one_strategy(
         equity.append(BacktestPoint(date=day, value=round(portfolio_value, 6)))
         drawdown.append(BacktestPoint(date=day, value=round(portfolio_value / peak - 1, 6)))
         transaction_cost_curve.append(BacktestPoint(date=day, value=round(total_transaction_cost, 6)))
+        if weights:
+            holding_snapshots.append(
+                BacktestHoldingSnapshot(
+                    date=day,
+                    holdings=_holdings_from_candidates(latest_candidates, weights, entry_dates, position_profits, day),
+                )
+            )
 
     metrics = _metrics(
         equity=equity,
@@ -358,7 +372,7 @@ def _run_one_strategy(
         rebalance_count=rebalance_count,
     )
     yearly = _yearly_returns(equity)
-    holdings = _holdings_from_candidates(latest_candidates, weights)
+    holdings = _holdings_from_candidates(latest_candidates, weights, entry_dates, position_profits, dates[-1])
     return StrategyBacktestResult(
         strategy_id=strategy_id,  # type: ignore[arg-type]
         strategy_name=str(config["name"]),
@@ -373,7 +387,13 @@ def _run_one_strategy(
     )
 
 
-def _holdings_from_candidates(candidates: list[Candidate], weights: dict[str, float]) -> list[BacktestHolding]:
+def _holdings_from_candidates(
+    candidates: list[Candidate],
+    weights: dict[str, float],
+    entry_dates: dict[str, date] | None = None,
+    position_profits: dict[str, float] | None = None,
+    day: date | None = None,
+) -> list[BacktestHolding]:
     return [
         BacktestHolding(
             stock_code=item.code,
@@ -382,6 +402,9 @@ def _holdings_from_candidates(candidates: list[Candidate], weights: dict[str, fl
             score=round(item.score, 2),
             dividend_yield=round(item.dividend_yield, 6),
             risk_score=round(item.risk_score, 2),
+            entry_date=entry_dates.get(item.code) if entry_dates else None,
+            holding_days=max(0, (day - entry_dates[item.code]).days) if day and entry_dates and item.code in entry_dates else 0,
+            profit=round(position_profits.get(item.code, 0.0), 2) if position_profits else 0.0,
         )
         for item in candidates
         if weights.get(item.code, 0.0) > 0

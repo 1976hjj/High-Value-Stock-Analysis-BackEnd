@@ -87,6 +87,46 @@ def test_held_price_change_is_counted(monkeypatch):
     assert result.equity_curve[-1].value == 103.333333
 
 
+def test_holding_profit_tracks_individual_stock_gain(monkeypatch):
+    days = [date(2025, 1, 1), date(2025, 1, 2)]
+    data = {
+        "A": _data("A", {days[0]: 10.0, days[1]: 10.0}),
+        "B": _data("B", {days[0]: 10.0, days[1]: 20.0}),
+        "C": _data("C", {days[0]: 10.0, days[1]: 10.0}),
+    }
+    ranks = {day: ["A", "B", "C"] for day in days}
+
+    result = _result(data, _query(), monkeypatch, ranks)
+    profits = {holding.stock_code: holding.profit for holding in result.holding_snapshots[-1].holdings}
+
+    assert profits["A"] == 0.0
+    assert profits["B"] == 33.33
+    assert profits["C"] == 0.0
+
+
+def test_holding_profit_includes_own_cash_dividend(monkeypatch):
+    days = [date(2025, 1, 1), date(2025, 1, 2)]
+    dividend = backtest.DividendEvent(
+        report_date=date(2024, 12, 31),
+        announcement_date=date(2024, 12, 20),
+        ex_dividend_date=days[1],
+        cash_per_share=1.0,
+    )
+    data = {
+        "A": _data("A", {day: 10.0 for day in days}, [dividend]),
+        "B": _data("B", {day: 10.0 for day in days}),
+        "C": _data("C", {day: 10.0 for day in days}),
+    }
+    ranks = {day: ["A", "B", "C"] for day in days}
+
+    result = _result(data, _query(), monkeypatch, ranks)
+    profits = {holding.stock_code: holding.profit for holding in result.holding_snapshots[-1].holdings}
+
+    assert profits["A"] == 3.33
+    assert profits["B"] == 0.0
+    assert profits["C"] == 0.0
+
+
 def test_reentered_holding_does_not_capture_gain_while_out_of_portfolio(monkeypatch):
     days = [
         date(2025, 1, 1),

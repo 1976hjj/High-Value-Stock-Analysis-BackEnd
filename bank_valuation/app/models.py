@@ -284,6 +284,9 @@ class BacktestHolding(BaseModel):
     score: float
     dividend_yield: float
     risk_score: float
+    entry_date: date | None = None
+    holding_days: int = 0
+    profit: float = 0.0
 
 
 class BacktestHoldingSnapshot(BaseModel):
