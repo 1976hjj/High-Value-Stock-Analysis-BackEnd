@@ -1,9 +1,11 @@
 """Dividend-oriented bank strategy backtests from local cached histories."""
 from __future__ import annotations
 
+import contextlib
+import csv
 from dataclasses import dataclass
 from datetime import date, timedelta
-import csv
+import io
 import math
 import statistics
 
@@ -27,6 +29,9 @@ from .mean_reversion import (
     _stable_growth_score,
 )
 from .service import value_bank
+
+
+MIN_BACKTEST_TRADING_DAYS = 120
 
 
 @dataclass
@@ -88,8 +93,12 @@ def run_strategy_backtest(query: StrategyBacktestQuery) -> StrategyBacktestRespo
     if start_date > end_date:
         raise RuntimeError("Backtest start_date cannot be later than end_date")
     dates = [day for day in all_dates if start_date <= day <= end_date]
-    if len(dates) < 252:
-        raise RuntimeError("可用价格历史不足，无法完成回测")
+    if len(dates) < MIN_BACKTEST_TRADING_DAYS:
+        raise RuntimeError(
+            "可用价格历史不足，无法完成回测："
+            f"当前日期区间只有 {len(dates)} 个交易日，至少需要 {MIN_BACKTEST_TRADING_DAYS} 个交易日；"
+            f"本地可用日期范围为 {all_dates[0]} 至 {all_dates[-1]}。"
+        )
     results = [
         _run_one_strategy(strategy_id, config, data, dates, query)
         for strategy_id, config in STRATEGIES.items()
@@ -128,10 +137,62 @@ def _load_backtest_data() -> dict[str, BankBacktestData]:
 
 
 def _read_dividend_events(code: str) -> list[DividendEvent]:
+    cached = _read_dividend_events_cache(code)
+    if cached is not None:
+        return cached
+    events = _fetch_dividend_events(code)
+    if events:
+        _write_dividend_events_cache(code, events)
+    return events
+
+
+def _dividend_events_path(code: str):
+    market_path = _market_path(code)
+    return market_path.with_name(market_path.name.replace("_market_history.csv", "_dividend_events.csv"))
+
+
+def _read_dividend_events_cache(code: str) -> list[DividendEvent] | None:
+    path = _dividend_events_path(code)
+    if not path.exists():
+        return None
+    events: list[DividendEvent] = []
+    try:
+        with path.open("r", encoding="utf-8", newline="") as file:
+            for row in csv.DictReader(file):
+                report_date = date.fromisoformat(row["report_date"])
+                announcement_date = date.fromisoformat(row["announcement_date"])
+                ex_dividend_date = _coerce_date(row.get("ex_dividend_date"))
+                cash_per_share = float(row["cash_per_share"])
+                if cash_per_share > 0:
+                    events.append(DividendEvent(report_date, announcement_date, ex_dividend_date, cash_per_share))
+    except (OSError, KeyError, ValueError):
+        return None
+    return sorted(events, key=lambda event: (event.announcement_date, event.report_date))
+
+
+def _write_dividend_events_cache(code: str, events: list[DividendEvent]) -> None:
+    path = _dividend_events_path(code)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=["report_date", "announcement_date", "ex_dividend_date", "cash_per_share"])
+        writer.writeheader()
+        writer.writerows(
+            {
+                "report_date": event.report_date.isoformat(),
+                "announcement_date": event.announcement_date.isoformat(),
+                "ex_dividend_date": event.ex_dividend_date.isoformat() if event.ex_dividend_date else "",
+                "cash_per_share": event.cash_per_share,
+            }
+            for event in sorted(events, key=lambda item: (item.announcement_date, item.report_date))
+        )
+
+
+def _fetch_dividend_events(code: str) -> list[DividendEvent]:
     try:
         import akshare as ak
 
-        frame = ak.stock_fhps_detail_em(symbol=_akshare_symbol(code))
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            frame = ak.stock_fhps_detail_em(symbol=_akshare_symbol(code))
     except Exception:
         return []
     if frame is None or frame.empty or len(frame.columns) < 17:

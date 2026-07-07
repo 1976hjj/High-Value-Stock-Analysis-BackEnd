@@ -286,6 +286,9 @@ def _dividend_event_key(
 def _coerce_date(value) -> date | None:
     if value is None:
         return None
+    text = str(value)
+    if text in {"", "NaT", "nan", "None", "none", "null", "NULL"}:
+        return None
     if isinstance(value, date):
         return value
     try:
@@ -294,7 +297,7 @@ def _coerce_date(value) -> date | None:
     except TypeError:
         pass
     try:
-        parsed = date.fromisoformat(str(value)[:10])
+        parsed = date.fromisoformat(text[:10])
     except ValueError:
         return None
     return parsed

@@ -181,3 +181,84 @@ def test_cash_dividend_is_counted_only_on_ex_dividend_date(monkeypatch):
 
     assert result.equity_curve[-1].value == 103.333333
     assert result.metrics.annual_dividend_return > 0
+
+
+def test_dividend_events_are_cached(monkeypatch, tmp_path):
+    path = tmp_path / "A_dividend_events.csv"
+    events = [
+        backtest.DividendEvent(
+            report_date=date(2024, 12, 31),
+            announcement_date=date(2025, 3, 30),
+            ex_dividend_date=date(2025, 7, 1),
+            cash_per_share=0.5,
+        )
+    ]
+
+    monkeypatch.setattr(backtest, "_dividend_events_path", lambda code: path)
+    monkeypatch.setattr(backtest, "_fetch_dividend_events", lambda code: events)
+
+    first = backtest._read_dividend_events("A")
+    assert first == events
+    assert path.exists()
+
+    monkeypatch.setattr(backtest, "_fetch_dividend_events", lambda code: (_ for _ in ()).throw(AssertionError("should use cache")))
+    second = backtest._read_dividend_events("A")
+
+    assert second == events
+
+
+def test_explicit_near_one_year_range_is_allowed(monkeypatch):
+    days = [date(2025, 1, 1).replace() for _ in range(1)]
+    days = [date.fromordinal(date(2025, 1, 1).toordinal() + index) for index in range(240)]
+    data = {"A": _data("A", {day: 10.0 for day in days})}
+
+    def fake_strategy(strategy_id, config, data, dates, query):
+        assert len(dates) == 240
+        return backtest.StrategyBacktestResult(
+            strategy_id=strategy_id,
+            strategy_name="test",
+            description="test",
+            metrics=backtest.BacktestMetrics(
+                total_return=0.0,
+                annualized_return=0.0,
+                max_drawdown=0.0,
+                max_drawdown_date=dates[0],
+                recovery_date=dates[-1],
+                recovery_days=0,
+                volatility=0.0,
+                sharpe=None,
+                calmar=None,
+                win_year_rate=0.0,
+                annual_dividend_return=0.0,
+                turnover=0.0,
+                rebalance_count=0,
+                total_transaction_cost=0.0,
+            ),
+            equity_curve=[backtest.BacktestPoint(date=dates[0], value=100.0), backtest.BacktestPoint(date=dates[-1], value=100.0)],
+            drawdown_curve=[backtest.BacktestPoint(date=dates[0], value=0.0), backtest.BacktestPoint(date=dates[-1], value=0.0)],
+            yearly_returns=[],
+            current_holdings=[],
+        )
+
+    monkeypatch.setattr(backtest, "_load_backtest_data", lambda: data)
+    monkeypatch.setattr(backtest, "_run_one_strategy", fake_strategy)
+
+    response = backtest.run_strategy_backtest(_query(start_date=days[0], end_date=days[-1]))
+
+    assert response.start_date == days[0]
+    assert response.end_date == days[-1]
+
+
+def test_too_short_explicit_range_reports_available_days(monkeypatch):
+    days = [date.fromordinal(date(2025, 1, 1).toordinal() + index) for index in range(30)]
+    monkeypatch.setattr(backtest, "_load_backtest_data", lambda: {"A": _data("A", {day: 10.0 for day in days})})
+
+    try:
+        backtest.run_strategy_backtest(_query(start_date=days[0], end_date=days[-1]))
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected short date range to fail")
+
+    assert "30 个交易日" in message
+    assert "至少需要" in message
