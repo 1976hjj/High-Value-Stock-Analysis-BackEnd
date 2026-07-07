@@ -18,6 +18,7 @@ DEFAULT_BANK_ASSUMPTIONS = {
     "long_term_growth": 0.03,
 }
 DEFAULT_PAYOUT_RATIO = 0.4
+DIVIDEND_LOOKBACK_DAYS = 365
 logger = logging.getLogger("bank_valuation.data")
 _BAOSTOCK_LOCK = threading.RLock()
 _CACHE_TTL_SECONDS = 120.0
@@ -226,17 +227,109 @@ def _latest_report(code: str, as_of: date) -> tuple[dict[str, str], dict[str, st
     raise RuntimeError("指定日期之前没有可用的 Baostock 财务报告")
 
 
+def _dividend_event_date(row: dict[str, str]) -> date | None:
+    for key in ("dividOperateDate", "dividPayDate"):
+        raw = row.get(key)
+        if _is_blank(raw):
+            continue
+        try:
+            return date.fromisoformat(raw)
+        except ValueError:
+            continue
+    return None
+
+
+def _dividend_announce_date(row: dict[str, str]) -> date | None:
+    for key in ("dividPlanAnnounceDate", "dividPreNoticeDate", "dividAgmPumDate", "dividPlanDate"):
+        raw = row.get(key)
+        if _is_blank(raw):
+            continue
+        try:
+            return date.fromisoformat(raw)
+        except ValueError:
+            continue
+    return None
+
+
+def _is_annual_dividend(row: dict[str, str], announce_date: date | None) -> bool:
+    if not _is_blank(row.get("dividAgmPumDate")):
+        return True
+    return announce_date is not None and announce_date.month <= 6
+
+
+def _dividend_report_year(row: dict[str, str], announce_date: date | None, is_annual: bool) -> int | None:
+    raw_year = row.get("statYear") or row.get("year") or row.get("dividYear")
+    if not _is_blank(raw_year):
+        try:
+            return int(float(raw_year))
+        except ValueError:
+            pass
+    if announce_date is None:
+        return None
+    return announce_date.year - 1 if is_annual else announce_date.year
+
+
+def _dividend_event_key(
+    report_year: int | None,
+    is_annual: bool,
+    event_date: date,
+    cash: float,
+) -> tuple[int | None, bool, str, float]:
+    return report_year, is_annual, event_date.isoformat(), round(cash, 8)
+
+
 def _trailing_dividend(code: str, as_of: date) -> float:
-    cash = 0.0
+    events: list[tuple[int | None, bool, date, float, bool]] = []
+    seen: set[tuple[int | None, bool, str, float]] = set()
+    window_start = as_of - timedelta(days=DIVIDEND_LOOKBACK_DAYS)
+    duplicate_count = 0
     for year in (as_of.year, as_of.year - 1, as_of.year - 2):
         for row in _rows(bs.query_dividend_data(code=code, year=year, yearType="report"), f"dividend {year}"):
-            event_date = row.get("dividOperateDate") or row.get("dividPayDate")
-            try:
-                if as_of - timedelta(days=370) <= date.fromisoformat(event_date) <= as_of:
-                    cash += _num(row, "dividCashPsBeforeTax")
-            except ValueError:
+            event_date = _dividend_event_date(row)
+            if event_date is None:
                 continue
-    logger.info("Trailing cash dividend: code=%s as_of=%s dividend_per_share=%.6f", code, as_of, cash)
+            row_cash = _num(row, "dividCashPsBeforeTax")
+            if row_cash <= 0:
+                continue
+            announce_date = _dividend_announce_date(row)
+            is_annual = _is_annual_dividend(row, announce_date)
+            report_year = _dividend_report_year(row, announce_date, is_annual)
+            event_key = _dividend_event_key(report_year, is_annual, event_date, row_cash)
+            if event_key in seen:
+                duplicate_count += 1
+                continue
+            seen.add(event_key)
+            is_paid_in_window = window_start <= event_date <= as_of
+            is_announced = announce_date is not None and announce_date <= as_of
+            if is_paid_in_window or (is_annual and is_announced):
+                events.append((report_year, is_annual, event_date, row_cash, is_paid_in_window))
+
+    latest_announced_annual_year = max(
+        (
+            report_year
+            for report_year, is_annual, _event_date, _cash, _is_paid in events
+            if is_annual and report_year is not None
+        ),
+        default=None,
+    )
+    if latest_announced_annual_year is None:
+        selected_events = [event for event in events if event[4]]
+    else:
+        selected_events = [
+            event
+            for event in events
+            if (event[1] and event[0] == latest_announced_annual_year) or (not event[1] and event[4])
+        ]
+    cash = sum(event[3] for event in selected_events)
+    logger.info(
+        "Trailing cash dividend: code=%s as_of=%s dividend_per_share=%.6f selected_events=%d unique_events=%d skipped_duplicates=%d",
+        code,
+        as_of,
+        cash,
+        len(selected_events),
+        len(seen),
+        duplicate_count,
+    )
     return cash
 
 

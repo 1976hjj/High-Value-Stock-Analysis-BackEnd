@@ -2,6 +2,7 @@ from bank_valuation.app.valuation.service import value_bank
 from bank_valuation.app.valuation import mean_reversion
 from bank_valuation.app.data_sources import bank_base
 from datetime import date
+from types import SimpleNamespace
 
 
 def test_full_result_contains_auditable_inputs_and_all_rim_horizons(bank):
@@ -46,6 +47,72 @@ def test_bank_csv_cache_round_trips_snapshot_and_market_history(monkeypatch, tmp
     assert restored.current_price == 6.0
     assert restored.pb_history == [.65, .66, .67]
     assert restored.price_history == [5.9, 5.95, 6.0]
+
+
+def test_trailing_dividend_deduplicates_same_cash_event(monkeypatch):
+    rows_by_year = {
+        "dividend 2026": [
+            {
+                "statYear": "2025",
+                "dividOperateDate": "2026-01-15",
+                "dividPayDate": "2026-01-15",
+                "dividCashPsBeforeTax": "1.0",
+            },
+            {
+                "statYear": "2025",
+                "dividOperateDate": "2026-01-15",
+                "dividPayDate": "2026-01-15",
+                "dividCashPsBeforeTax": "1.0",
+            },
+        ],
+        "dividend 2025": [
+            {
+                "statYear": "2024",
+                "dividOperateDate": "2025-07-10",
+                "dividPayDate": "2025-07-10",
+                "dividCashPsBeforeTax": "2.0",
+            },
+            {
+                "statYear": "2024",
+                "dividOperateDate": "2025-07-05",
+                "dividPayDate": "2025-07-05",
+                "dividCashPsBeforeTax": "9.0",
+            },
+        ],
+        "dividend 2024": [],
+    }
+
+    monkeypatch.setattr(bank_base, "bs", SimpleNamespace(query_dividend_data=lambda **kwargs: object()))
+    monkeypatch.setattr(bank_base, "_rows", lambda query, source: rows_by_year[source])
+
+    assert bank_base._trailing_dividend("sh.600036", date(2026, 7, 7)) == 3.0
+
+
+def test_trailing_dividend_keeps_distinct_real_events(monkeypatch):
+    rows_by_year = {
+        "dividend 2026": [
+            {
+                "statYear": "2025",
+                "dividOperateDate": "2026-01-15",
+                "dividPayDate": "2026-01-15",
+                "dividCashPsBeforeTax": "1.0",
+            }
+        ],
+        "dividend 2025": [
+            {
+                "statYear": "2024",
+                "dividOperateDate": "2025-07-10",
+                "dividPayDate": "2025-07-10",
+                "dividCashPsBeforeTax": "2.0",
+            }
+        ],
+        "dividend 2024": [],
+    }
+
+    monkeypatch.setattr(bank_base, "bs", SimpleNamespace(query_dividend_data=lambda **kwargs: object()))
+    monkeypatch.setattr(bank_base, "_rows", lambda query, source: rows_by_year[source])
+
+    assert bank_base._trailing_dividend("sh.600036", date(2026, 7, 7)) == 3.0
 
 
 def test_mean_reversion_overview_ranks_healthy_cheap_bank_above_risky_discount(monkeypatch, bank):
