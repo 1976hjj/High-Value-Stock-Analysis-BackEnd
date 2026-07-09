@@ -25,6 +25,7 @@ class BankInput(BaseModel):
     pb_current: float = Field(gt=0)
     pe_current: float | None = Field(default=None, gt=0)
     pb_history: list[float] = Field(min_length=1)
+    pe_history: list[float | None] = Field(default_factory=list)
     nim: float | None = Field(default=None, ge=-0.2, le=0.2)
     npl_ratio: float | None = Field(default=None, ge=0, le=1)
     provision_coverage: float | None = Field(default=None, ge=0, le=20)
@@ -157,6 +158,9 @@ class BankQuery(BaseModel):
     stock_code: str = Field(description="例如 601398、sh.601398 或 sz.000001")
     valuation_date: date | None = Field(default=None, description="估值日期；留空时使用最近可获得交易日")
     refresh_cache: bool = Field(default=False, description="为 true 时忽略本地CSV缓存并重新查询 Baostock")
+    history_years: int | None = Field(default=10, ge=1, le=40, description="历史行情年数；为 null 且 include_full_history=true 时拉取全历史")
+    include_full_history: bool = Field(default=False, description="为 true 时尽量从上市以来拉取 PB/PE/收盘价历史")
+    include_pe_history: bool = Field(default=True, description="为 true 时在历史行情中同时返回可取得的 PE")
 
 
 class BatchBankQuery(BaseModel):

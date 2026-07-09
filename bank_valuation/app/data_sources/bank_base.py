@@ -23,8 +23,9 @@ DIVIDEND_LOOKBACK_DAYS = 365
 logger = logging.getLogger("bank_valuation.data")
 _BAOSTOCK_LOCK = threading.RLock()
 _CACHE_TTL_SECONDS = 120.0
-_data_cache: dict[tuple[str, str], tuple[float, BankInput]] = {}
+_data_cache: dict[tuple[str, str, bool, int | None, bool], tuple[float, BankInput]] = {}
 _BANK_CACHE_DIR = Path("output") / "bank_cache"
+FULL_HISTORY_START_DATE = date(1990, 1, 1)
 
 # Baostock's company-name encoding can vary by environment. This service is
 # specifically for A-share banks, so known names are kept deterministic.
@@ -107,19 +108,39 @@ def _market_path(code: str) -> Path:
     return _BANK_CACHE_DIR / f"{_cache_stem(code)}_market_history.csv"
 
 
-def _write_disk_cache(requested_date: date, bank: BankInput) -> None:
+def _history_start_date(
+    requested_date: date,
+    history_years: int | None = 10,
+    include_full_history: bool = False,
+) -> date:
+    if include_full_history or history_years is None:
+        return FULL_HISTORY_START_DATE
+    return requested_date - timedelta(days=max(1, history_years) * 366)
+
+
+def _write_disk_cache(
+    requested_date: date,
+    bank: BankInput,
+    *,
+    include_full_history: bool = False,
+    history_years: int | None = 10,
+) -> None:
     """Persist a reproducible input snapshot and the daily market series used by it."""
     _BANK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     snapshot = _snapshot_path(bank.stock_code)
     snapshot_fields = [
         "requested_date", "stock_code", "stock_name", "market_date", "financial_report_date", "current_price", "daily_change_pct", "bps", "eps", "roe", "net_profit", "profit_growth_yoy", "dividend_per_share", "payout_ratio", "dividend_yield", "pb_current", "pe_current", "nim", "npl_ratio", "provision_coverage", "provision_coverage_report_date", "provision_coverage_source", "cet1_ratio", "capital_adequacy_ratio", "net_interest_spread", "loan_provision_ratio", "loan_to_deposit_ratio", "bank_special_metrics_report_date", "bank_special_metrics_source", "risk_free_rate", "equity_risk_premium", "beta", "long_term_growth", "roe_trend", "nim_change", "npl_ratio_change", "provision_coverage_change", "dividend_stable",
+        "history_full", "history_years", "history_start_date",
     ]
     existing: list[dict[str, str]] = []
     if snapshot.exists():
         with snapshot.open("r", encoding="utf-8", newline="") as file:
             existing = list(csv.DictReader(file))
-    row = {field: str(getattr(bank, field)) for field in snapshot_fields if field not in {"requested_date"}}
+    row = {field: str(getattr(bank, field)) for field in snapshot_fields if field not in {"requested_date", "history_full", "history_years", "history_start_date"}}
     row["requested_date"] = requested_date.isoformat()
+    row["history_full"] = str(include_full_history or history_years is None)
+    row["history_years"] = "" if history_years is None else str(history_years)
+    row["history_start_date"] = str(bank.pb_history_dates[0]) if bank.pb_history_dates else ""
     # A retry or forced refresh replaces the same requested-date row rather than duplicating it.
     existing = [item for item in existing if item.get("requested_date") != row["requested_date"]]
     existing.append(row)
@@ -135,14 +156,27 @@ def _write_disk_cache(requested_date: date, bank: BankInput) -> None:
             market_rows = {item["date"]: item for item in csv.DictReader(file) if item.get("date")}
     for index, point_date in enumerate(bank.pb_history_dates):
         if index < len(bank.price_history) and index < len(bank.pb_history):
-            market_rows[str(point_date)] = {"date": str(point_date), "close": str(bank.price_history[index]), "pb": str(bank.pb_history[index])}
+            pe = bank.pe_history[index] if index < len(bank.pe_history) else None
+            market_rows[str(point_date)] = {
+                "date": str(point_date),
+                "close": str(bank.price_history[index]),
+                "pb": str(bank.pb_history[index]),
+                "pe": "" if pe is None else str(pe),
+            }
     with market.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=["date", "close", "pb"])
+        writer = csv.DictWriter(file, fieldnames=["date", "close", "pb", "pe"])
         writer.writeheader(); writer.writerows(sorted(market_rows.values(), key=lambda item: item["date"]))
     logger.info("Bank CSV cache written: snapshot=%s market=%s", snapshot, market)
 
 
-def _read_disk_cache(code: str, requested_date: date, allow_stale_current: bool = False) -> BankInput | None:
+def _read_disk_cache(
+    code: str,
+    requested_date: date,
+    allow_stale_current: bool = False,
+    *,
+    include_full_history: bool = False,
+    history_years: int | None = 10,
+) -> BankInput | None:
     snapshot, market = _snapshot_path(code), _market_path(code)
     if not snapshot.exists() or not market.exists():
         return None
@@ -152,6 +186,9 @@ def _read_disk_cache(code: str, requested_date: date, allow_stale_current: bool 
             row = next((item for item in csv.DictReader(file) if item.get("requested_date") == requested_date.isoformat()), None)
         if row is None:
             return None
+        if include_full_history and row.get("history_full") != "True":
+            logger.info("Bank CSV cache is not full-history; will refresh: code=%s requested_date=%s", code, requested_date)
+            return None
         market_date = date.fromisoformat(row["market_date"])
         if not allow_stale_current and requested_date >= date.today() and market_date < requested_date:
             logger.info(
@@ -159,7 +196,7 @@ def _read_disk_cache(code: str, requested_date: date, allow_stale_current: bool 
                 code, requested_date, market_date,
             )
             return None
-        history_start = market_date - timedelta(days=3660)
+        history_start = _history_start_date(market_date, history_years, include_full_history)
         with market.open("r", encoding="utf-8", newline="") as file:
             history = [item for item in csv.DictReader(file) if history_start <= date.fromisoformat(item["date"]) <= market_date]
         if not history:
@@ -174,7 +211,7 @@ def _read_disk_cache(code: str, requested_date: date, allow_stale_current: bool 
         else:
             daily_change_pct = None
         restored = BankInput(
-            stock_code=row["stock_code"], stock_name=row["stock_name"], current_price=value("current_price"), daily_change_pct=daily_change_pct, bps=value("bps"), eps=value("eps"), roe=value("roe"), net_profit=value("net_profit"), profit_growth_yoy=value("profit_growth_yoy"), dividend_per_share=value("dividend_per_share"), payout_ratio=value("payout_ratio"), dividend_yield=value("dividend_yield"), pb_current=value("pb_current"), pe_current=value("pe_current") if not _is_blank(row.get("pe_current")) else None, pb_history=[float(item["pb"]) for item in history], nim=_optional_float(row, "nim"), npl_ratio=_optional_float(row, "npl_ratio"), provision_coverage=_optional_float(row, "provision_coverage"), provision_coverage_report_date=date.fromisoformat(row["provision_coverage_report_date"]) if not _is_blank(row.get("provision_coverage_report_date")) else None, provision_coverage_source=row.get("provision_coverage_source") if not _is_blank(row.get("provision_coverage_source")) else None, cet1_ratio=_optional_float(row, "cet1_ratio"), capital_adequacy_ratio=_optional_float(row, "capital_adequacy_ratio"), net_interest_spread=_optional_float(row, "net_interest_spread"), loan_provision_ratio=_optional_float(row, "loan_provision_ratio"), loan_to_deposit_ratio=_optional_float(row, "loan_to_deposit_ratio"), risk_free_rate=value("risk_free_rate"), equity_risk_premium=value("equity_risk_premium"), beta=value("beta"), long_term_growth=value("long_term_growth"), market_date=market_date, financial_report_date=date.fromisoformat(row["financial_report_date"]), pb_history_dates=[date.fromisoformat(item["date"]) for item in history], price_history=[float(item["close"]) for item in history], roe_trend=value("roe_trend"), nim_change=value("nim_change"), npl_ratio_change=value("npl_ratio_change"), provision_coverage_change=value("provision_coverage_change"), dividend_stable=row.get("dividend_stable", "True").lower() == "true",
+            stock_code=row["stock_code"], stock_name=row["stock_name"], current_price=value("current_price"), daily_change_pct=daily_change_pct, bps=value("bps"), eps=value("eps"), roe=value("roe"), net_profit=value("net_profit"), profit_growth_yoy=value("profit_growth_yoy"), dividend_per_share=value("dividend_per_share"), payout_ratio=value("payout_ratio"), dividend_yield=value("dividend_yield"), pb_current=value("pb_current"), pe_current=value("pe_current") if not _is_blank(row.get("pe_current")) else None, pb_history=[float(item["pb"]) for item in history], pe_history=[None if _is_blank(item.get("pe")) else float(item["pe"]) for item in history], nim=_optional_float(row, "nim"), npl_ratio=_optional_float(row, "npl_ratio"), provision_coverage=_optional_float(row, "provision_coverage"), provision_coverage_report_date=date.fromisoformat(row["provision_coverage_report_date"]) if not _is_blank(row.get("provision_coverage_report_date")) else None, provision_coverage_source=row.get("provision_coverage_source") if not _is_blank(row.get("provision_coverage_source")) else None, cet1_ratio=_optional_float(row, "cet1_ratio"), capital_adequacy_ratio=_optional_float(row, "capital_adequacy_ratio"), net_interest_spread=_optional_float(row, "net_interest_spread"), loan_provision_ratio=_optional_float(row, "loan_provision_ratio"), loan_to_deposit_ratio=_optional_float(row, "loan_to_deposit_ratio"), risk_free_rate=value("risk_free_rate"), equity_risk_premium=value("equity_risk_premium"), beta=value("beta"), long_term_growth=value("long_term_growth"), market_date=market_date, financial_report_date=date.fromisoformat(row["financial_report_date"]), pb_history_dates=[date.fromisoformat(item["date"]) for item in history], price_history=[float(item["close"]) for item in history], roe_trend=value("roe_trend"), nim_change=value("nim_change"), npl_ratio_change=value("npl_ratio_change"), provision_coverage_change=value("provision_coverage_change"), dividend_stable=row.get("dividend_stable", "True").lower() == "true",
         )
         # Legacy CSV files contained synthetic bank-specific defaults. Only use
         # these fields when a real source marker is present.
@@ -407,7 +444,14 @@ def _trailing_dividend(code: str, as_of: date) -> float:
     return cash
 
 
-def _load_bank_input_once(stock_code: str, valuation_date: date | None = None) -> BankInput:
+def _load_bank_input_once(
+    stock_code: str,
+    valuation_date: date | None = None,
+    *,
+    history_years: int | None = 10,
+    include_full_history: bool = False,
+    include_pe_history: bool = True,
+) -> BankInput:
     """Get daily market data plus the latest report available on the given date."""
     code = normalize_code(stock_code)
     requested_date = valuation_date or date.today()
@@ -418,10 +462,11 @@ def _load_bank_input_once(stock_code: str, valuation_date: date | None = None) -
         raise RuntimeError(f"Baostock 登录失败: {login.error_msg}")
     logger.info("Baostock login succeeded: code=%s", code)
     try:
-        # 10-year PB history; the last available trading day on or before the date is used.
-        start = requested_date - timedelta(days=3660)
+        # Historical PB/PE/close history; the last available trading day on or before the date is used.
+        start = _history_start_date(requested_date, history_years, include_full_history)
+        fields = "date,code,close,pbMRQ,peTTM" if include_pe_history else "date,code,close,pbMRQ"
         market = _rows(bs.query_history_k_data_plus(
-            code, "date,code,close,pbMRQ", start_date=start.isoformat(), end_date=requested_date.isoformat(),
+            code, fields, start_date=start.isoformat(), end_date=requested_date.isoformat(),
             frequency="d", adjustflag="3",
         ), "daily price/PB")
         valid_market = [row for row in market if _num(row, "close") > 0 and _num(row, "pbMRQ") > 0]
@@ -448,7 +493,9 @@ def _load_bank_input_once(stock_code: str, valuation_date: date | None = None) -
             net_profit=_num(profit, "netProfit"), profit_growth_yoy=_num(growth, "YOYNI"),
             dividend_per_share=dividend, payout_ratio=payout, dividend_yield=dividend / close if close else 0,
             pb_current=pb, pe_current=(close / eps if eps > 0 else None),
-            pb_history=[_num(row, "pbMRQ") for row in valid_market], market_date=actual_date,
+            pb_history=[_num(row, "pbMRQ") for row in valid_market],
+            pe_history=[_num(row, "peTTM") if include_pe_history and _num(row, "peTTM") > 0 else None for row in valid_market],
+            market_date=actual_date,
             financial_report_date=date.fromisoformat(profit["statDate"]),
             pb_history_dates=[date.fromisoformat(row["date"]) for row in valid_market],
             price_history=[_num(row, "close") for row in valid_market], **DEFAULT_BANK_ASSUMPTIONS,
@@ -468,7 +515,15 @@ def _load_bank_input_once(stock_code: str, valuation_date: date | None = None) -
             logger.warning("Baostock logout skipped after an invalid connection: code=%s", code, exc_info=True)
 
 
-def load_bank_input(stock_code: str, valuation_date: date | None = None, refresh_cache: bool = False) -> BankInput:
+def load_bank_input(
+    stock_code: str,
+    valuation_date: date | None = None,
+    refresh_cache: bool = False,
+    *,
+    history_years: int | None = 10,
+    include_full_history: bool = False,
+    include_pe_history: bool = True,
+) -> BankInput:
     """Load data safely despite Baostock's process-global, non-thread-safe client.
 
     Baostock uses shared socket state. FastAPI may serve valuation and Monte Carlo
@@ -477,7 +532,7 @@ def load_bank_input(stock_code: str, valuation_date: date | None = None, refresh
     """
     code = normalize_code(stock_code)
     requested_date = valuation_date or date.today()
-    cache_key = (code, requested_date.isoformat())
+    cache_key = (code, requested_date.isoformat(), include_full_history, history_years, include_pe_history)
     now = time.monotonic()
     with _BAOSTOCK_LOCK:
         cached = _data_cache.get(cache_key)
@@ -486,11 +541,21 @@ def load_bank_input(stock_code: str, valuation_date: date | None = None, refresh
             return cached[1].model_copy(deep=True)
 
         if not refresh_cache:
-            disk_cached = _read_disk_cache(code, requested_date)
+            disk_cached = _read_disk_cache(
+                code,
+                requested_date,
+                include_full_history=include_full_history,
+                history_years=history_years,
+            )
             if disk_cached is not None:
                 enriched = _enrich_bank_special_metrics(disk_cached)
                 if enriched is not disk_cached:
-                    _write_disk_cache(requested_date, enriched)
+                    _write_disk_cache(
+                        requested_date,
+                        enriched,
+                        include_full_history=include_full_history,
+                        history_years=history_years,
+                    )
                     disk_cached = enriched
                 _data_cache[cache_key] = (time.monotonic(), disk_cached)
                 logger.info("Bank CSV cache hit: code=%s requested_date=%s", code, requested_date)
@@ -500,9 +565,20 @@ def load_bank_input(stock_code: str, valuation_date: date | None = None, refresh
         for attempt in range(1, 4):
             try:
                 logger.info("Data load attempt %d/3: code=%s requested_date=%s", attempt, code, requested_date)
-                result = _enrich_bank_special_metrics(_load_bank_input_once(code, requested_date))
+                result = _enrich_bank_special_metrics(_load_bank_input_once(
+                    code,
+                    requested_date,
+                    history_years=history_years,
+                    include_full_history=include_full_history,
+                    include_pe_history=include_pe_history,
+                ))
                 _data_cache[cache_key] = (time.monotonic(), result)
-                _write_disk_cache(requested_date, result)
+                _write_disk_cache(
+                    requested_date,
+                    result,
+                    include_full_history=include_full_history,
+                    history_years=history_years,
+                )
                 # Keep the small cache bounded for a long-running API process.
                 if len(_data_cache) > 100:
                     oldest_key = min(_data_cache, key=lambda item: _data_cache[item][0])

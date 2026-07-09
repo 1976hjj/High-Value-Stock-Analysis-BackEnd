@@ -18,8 +18,22 @@ logger = logging.getLogger("bank_valuation.api")
 def valuation(query: BankQuery):
     """Simple API: only a bank code and optional historical valuation date."""
     try:
-        logger.info("POST /valuation received: stock_code=%s valuation_date=%s", query.stock_code, query.valuation_date)
-        bank = load_bank_input(query.stock_code, query.valuation_date, query.refresh_cache)
+        logger.info(
+            "POST /valuation received: stock_code=%s valuation_date=%s full_history=%s history_years=%s pe_history=%s",
+            query.stock_code,
+            query.valuation_date,
+            query.include_full_history,
+            query.history_years,
+            query.include_pe_history,
+        )
+        bank = load_bank_input(
+            query.stock_code,
+            query.valuation_date,
+            query.refresh_cache,
+            history_years=query.history_years,
+            include_full_history=query.include_full_history,
+            include_pe_history=query.include_pe_history,
+        )
         return value_bank(bank)
     except (ValueError, RuntimeError) as exc:
         logger.exception("POST /valuation failed: stock_code=%s", query.stock_code)

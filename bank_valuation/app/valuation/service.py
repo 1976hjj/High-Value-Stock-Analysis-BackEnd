@@ -233,18 +233,21 @@ def _snapshot(bank: BankInput) -> dict[str, float | str | bool | None]:
 
 
 def _sample_pb_history(bank: BankInput, max_points: int = 120) -> list[dict[str, float | str | None]]:
-    """Return chart-ready PB and actual close-price history without a daily payload."""
+    """Return chart-ready PB/PE and actual close-price history without a daily payload."""
     if not bank.pb_history_dates or len(bank.pb_history_dates) != len(bank.pb_history):
         return []
     step = max(1, len(bank.pb_history) // max_points)
     prices_match = len(bank.price_history) == len(bank.pb_history)
+    pe_match = len(bank.pe_history) == len(bank.pb_history)
     points = [{
         "date": str(bank.pb_history_dates[index]), "pb": round(bank.pb_history[index], 4),
+        "pe": round(bank.pe_history[index], 4) if pe_match and bank.pe_history[index] is not None else None,
         "close": round(bank.price_history[index], 4) if prices_match else None,
     } for index in range(0, len(bank.pb_history), step)]
     if points[-1]["date"] != str(bank.pb_history_dates[-1]):
         points.append({
             "date": str(bank.pb_history_dates[-1]), "pb": round(bank.pb_history[-1], 4),
+            "pe": round(bank.pe_history[-1], 4) if pe_match and bank.pe_history[-1] is not None else None,
             "close": round(bank.price_history[-1], 4) if prices_match else None,
         })
     return points
