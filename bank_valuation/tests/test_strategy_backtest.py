@@ -1,5 +1,7 @@
 from datetime import date
 
+import pytest
+
 from bank_valuation.app.models import BankInput, StrategyBacktestQuery
 from bank_valuation.app.valuation import strategy_backtest as backtest
 
@@ -221,6 +223,33 @@ def test_cash_dividend_is_counted_only_on_ex_dividend_date(monkeypatch):
 
     assert result.equity_curve[-1].value == 103.333333
     assert result.metrics.annual_dividend_return > 0
+
+
+def test_missing_dividend_history_does_not_fall_back_to_current_bank_value():
+    item = _data("A", {date(2026, 7, 10): 10.0}, [])
+    item.bank.dividend_per_share = 9.99
+
+    assert backtest._historical_dividend_yield(item, 10.0, date(2026, 7, 10)) is None
+
+
+def test_duplicate_dividend_event_is_not_counted_twice():
+    day = date(2026, 7, 10)
+    event = backtest.DividendEvent(
+        report_date=date(2025, 12, 31),
+        announcement_date=date(2026, 3, 20),
+        ex_dividend_date=day,
+        cash_per_share=0.5,
+    )
+    duplicate = backtest.DividendEvent(
+        report_date=date(2025, 12, 31),
+        announcement_date=date(2026, 3, 25),
+        ex_dividend_date=day,
+        cash_per_share=0.5,
+    )
+    item = _data("A", {day: 10.0}, [event, duplicate])
+
+    assert backtest._cash_dividend_on_day(item, day) == pytest.approx(0.5)
+    assert backtest._historical_dividend_yield(item, 10.0, day) == pytest.approx(0.05)
 
 
 def test_dividend_events_are_cached(monkeypatch, tmp_path):

@@ -60,7 +60,7 @@ class Candidate:
     code: str
     name: str
     score: float
-    dividend_yield: float
+    dividend_yield: float | None
     risk_score: float
 
 
@@ -400,7 +400,7 @@ def _holdings_from_candidates(
             stock_name=item.name,
             weight=round(weights.get(item.code, 0.0), 6),
             score=round(item.score, 2),
-            dividend_yield=round(item.dividend_yield, 6),
+            dividend_yield=round(item.dividend_yield, 6) if item.dividend_yield is not None else None,
             risk_score=round(item.risk_score, 2),
             entry_date=entry_dates.get(item.code) if entry_dates else None,
             holding_days=max(0, (day - entry_dates[item.code]).days) if day and entry_dates and item.code in entry_dates else 0,
@@ -428,6 +428,8 @@ def _rank_candidates(
         stable = _stable_growth_score(bank, risk)
         quality = _quality_score(bank)
         dividend_yield = _historical_dividend_yield(item, point.close, day)
+        if dividend_yield is None:
+            continue
         pb_percentile = _pb_percentile(item.market, day, point.pb, years=5)
         median_pb = _median_pb_until(item.market, day, years=5)
         reversion = max(0.0, median_pb / point.pb - 1) if point.pb > 0 and median_pb > 0 else 0.0
@@ -492,13 +494,32 @@ def _target_weights(strategy_id: str, candidates: list[Candidate], target_count:
     return {item.code: invested * raw[index] / total for index, item in enumerate(selected)}
 
 
-def _historical_dividend_yield(item: BankBacktestData, price: float, day: date) -> float:
-    if price <= 0:
-        return 0.0
-    dividend_per_share = _announced_fiscal_year_dividend(item, day)
-    if dividend_per_share <= 0:
-        dividend_per_share = item.bank.dividend_per_share
+def _historical_dividend_yield(item: BankBacktestData, price: float, day: date) -> float | None:
+    if price <= 0 or not item.dividends:
+        return None
+    start = day - timedelta(days=365)
+    dividend_per_share = sum(
+        event.cash_per_share
+        for event in _deduplicate_implemented_dividends(item.dividends)
+        if (
+            event.ex_dividend_date is not None
+            and start < event.ex_dividend_date <= day
+            and event.announcement_date <= day
+        )
+    )
     return min(dividend_per_share / price, 0.15)
+
+
+def _deduplicate_implemented_dividends(events: list[DividendEvent]) -> list[DividendEvent]:
+    unique: dict[tuple[date, float], DividendEvent] = {}
+    for event in events:
+        if event.ex_dividend_date is None or event.cash_per_share <= 0:
+            continue
+        key = (event.ex_dividend_date, round(event.cash_per_share, 8))
+        existing = unique.get(key)
+        if existing is None or event.announcement_date < existing.announcement_date:
+            unique[key] = event
+    return list(unique.values())
 
 
 def _announced_fiscal_year_dividend(item: BankBacktestData, day: date) -> float:
@@ -514,7 +535,7 @@ def _announced_fiscal_year_dividend(item: BankBacktestData, day: date) -> float:
 def _cash_dividend_on_day(item: BankBacktestData, day: date) -> float:
     return sum(
         event.cash_per_share
-        for event in item.dividends
+        for event in _deduplicate_implemented_dividends(item.dividends)
         if event.ex_dividend_date == day and event.announcement_date <= day
     )
 
@@ -552,8 +573,9 @@ def _metrics(
     total_turnover: float,
     total_transaction_cost: float,
     rebalance_count: int,
+    initial_value: float | None = None,
 ) -> BacktestMetrics:
-    start_value = equity[0].value
+    start_value = initial_value if initial_value is not None else equity[0].value
     end_value = equity[-1].value
     days = max((equity[-1].date - equity[0].date).days, 1)
     total_return = end_value / start_value - 1

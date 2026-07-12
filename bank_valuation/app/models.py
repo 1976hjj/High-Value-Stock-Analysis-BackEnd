@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from datetime import date
 from typing import Literal
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class BankInput(BaseModel):
@@ -271,6 +271,209 @@ class StrategyBacktestQuery(BaseModel):
     cash_yield: float = Field(default=0.015, ge=0, le=0.1)
 
 
+IndustryId = Literal[
+    "telecom",
+    "hydro",
+    "bank",
+    "tollroad",
+    "nuclear",
+    "oilgas",
+    "resources",
+    "consumer",
+]
+
+ALL_INDUSTRY_IDS: tuple[IndustryId, ...] = (
+    "telecom",
+    "hydro",
+    "bank",
+    "tollroad",
+    "nuclear",
+    "oilgas",
+    "resources",
+    "consumer",
+)
+
+
+class CrossIndustryStrategyBacktestQuery(StrategyBacktestQuery):
+    model_config = ConfigDict(extra="forbid")
+
+    universe_mode: Literal["single", "selected", "all"] = "single"
+    industry_ids: list[IndustryId] = Field(default_factory=lambda: ["bank"])
+    industry_weighting: Literal["equal", "risk_parity", "score"] = "risk_parity"
+    max_industry_weight: float = Field(default=.3, ge=.1, le=1)
+    crisis_cash_buffer: float = Field(default=.1, ge=0, le=.3)
+    holding_count: int = Field(default=12, ge=3, le=40)
+
+    @field_validator("industry_ids")
+    @classmethod
+    def deduplicate_industries(cls, value: list[IndustryId]) -> list[IndustryId]:
+        return list(dict.fromkeys(value))
+
+    @model_validator(mode="after")
+    def validate_universe(self):
+        if self.universe_mode == "all":
+            self.industry_ids = list(ALL_INDUSTRY_IDS)
+        elif self.universe_mode == "single" and len(self.industry_ids) != 1:
+            raise ValueError("单行业模式必须且只能选择一个行业")
+        elif self.universe_mode == "selected" and not self.industry_ids:
+            raise ValueError("多行业模式至少选择一个行业")
+
+        if len(self.industry_ids) > 1:
+            required = 1 - self.crisis_cash_buffer
+            available = len(self.industry_ids) * self.max_industry_weight
+            if available + 1e-9 < required:
+                minimum = required / len(self.industry_ids)
+                raise ValueError(
+                    f"单行业权重上限不可行：当前至少需要 {minimum:.1%}，"
+                    f"才能在保留 {self.crisis_cash_buffer:.1%} 危机缓冲仓后完成配置"
+                )
+            if self.holding_count < len(self.industry_ids):
+                raise ValueError("持仓数量不能少于已选行业数量")
+        return self
+
+
+class IndustryAnalysisQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    industry_id: IndustryId
+    stock_code: str
+    valuation_date: date | None = None
+    refresh_cache: bool = False
+
+
+class IndustryFactorMetric(BaseModel):
+    key: str
+    label: str
+    value: str
+    score: float = Field(ge=0, le=100)
+    status: Literal["strong", "stable", "watch", "risk"]
+    source: str
+
+
+class IndustryAnalysisScores(BaseModel):
+    defense: float = Field(ge=0, le=100)
+    income: float = Field(ge=0, le=100)
+    quality: float = Field(ge=0, le=100)
+    valuation: float = Field(ge=0, le=100)
+    risk: float = Field(ge=0, le=100)
+    overall: float = Field(ge=0, le=100)
+
+
+class IndustryPanoramaMetric(BaseModel):
+    key: str
+    label: str
+    value: str
+    raw_value: float | None = None
+    score: float = Field(ge=0, le=100)
+    status: Literal["strong", "stable", "watch", "risk"]
+    quality: Literal["reported", "derived", "proxy"]
+    interpretation: str
+    source: str
+
+
+class IndustryPanoramaGroup(BaseModel):
+    id: str
+    title: str
+    metrics: list[IndustryPanoramaMetric]
+
+
+class IndustryPanorama(BaseModel):
+    report_date: date
+    published_date: date
+    coverage_ratio: float = Field(ge=0, le=1)
+    groups: list[IndustryPanoramaGroup]
+
+
+class IndustryPriceScenario(BaseModel):
+    id: Literal["bull", "base", "bear", "crisis"]
+    name: str
+    earnings_change: float
+    target_pe: float
+    dividend_yield_anchor: float | None = None
+    price_low: float = Field(gt=0)
+    price_mid: float = Field(gt=0)
+    price_high: float = Field(gt=0)
+    return_low: float
+    return_mid: float
+    return_high: float
+    confidence: float = Field(ge=0, le=1)
+    drivers: list[str]
+    triggers: list[str]
+    formula: str
+
+
+class IndustryPriceProjection(BaseModel):
+    model_name: str
+    current_price: float = Field(gt=0)
+    current_pe: float = Field(gt=0)
+    implied_eps_ttm: float = Field(gt=0)
+    market_date: date
+    report_date: date
+    scenarios: list[IndustryPriceScenario]
+    base_value_mid: float = Field(gt=0)
+    defensive_entry_price: float = Field(gt=0)
+    conclusion: str
+    assumptions: list[str]
+    data_note: str
+
+
+class IndustryAnalysisResponse(BaseModel):
+    module: str = "industry_analysis"
+    industry_id: IndustryId
+    industry_name: str
+    stock_code: str
+    stock_name: str
+    market_date: date
+    valuation_date: date
+    current_price: float = Field(gt=0)
+    daily_change_pct: float | None = None
+    current_pb: float | None = None
+    current_pe: float | None = None
+    valuation_metric: Literal["pb", "pe"]
+    valuation_percentile: float = Field(ge=0, le=1)
+    scores: IndustryAnalysisScores
+    metrics: list[IndustryFactorMetric]
+    panorama: IndustryPanorama | None = None
+    price_projection: IndustryPriceProjection | None = None
+    risk_flags: list[str]
+    data_note: str
+
+
+class IndustryRankingQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    industry_id: Literal["hydro", "consumer", "resources", "oilgas", "tollroad", "nuclear", "telecom"]
+    valuation_date: date | None = None
+    refresh_cache: bool = False
+
+
+class IndustryRankingRow(BaseModel):
+    rank: int = Field(ge=1)
+    stock_code: str
+    stock_name: str
+    market_date: date
+    report_date: date | None = None
+    overall_score: float = Field(ge=0, le=100)
+    defense_score: float = Field(ge=0, le=100)
+    quality_score: float = Field(ge=0, le=100)
+    income_score: float = Field(ge=0, le=100)
+    valuation_score: float = Field(ge=0, le=100)
+    risk_score: float = Field(ge=0, le=100)
+    valuation_percentile: float = Field(ge=0, le=1)
+    key_metrics: list[IndustryPanoramaMetric]
+    risk_flags: list[str]
+
+
+class IndustryRankingResponse(BaseModel):
+    module: str = "industry_ranking"
+    industry_id: Literal["hydro", "consumer", "resources", "oilgas", "tollroad", "nuclear", "telecom"]
+    valuation_date: date
+    result_count: int = Field(ge=0)
+    results: list[IndustryRankingRow]
+    failures: list[dict[str, str]]
+    data_note: str
+
+
 class BacktestPoint(BaseModel):
     date: date
     value: float
@@ -284,13 +487,17 @@ class BacktestYearReturn(BaseModel):
 class BacktestHolding(BaseModel):
     stock_code: str
     stock_name: str
+    industry_id: str | None = None
     weight: float
     score: float
-    dividend_yield: float
+    dividend_yield: float | None
     risk_score: float
     entry_date: date | None = None
     holding_days: int = 0
     profit: float = 0.0
+    position_value: float = 0.0
+    cost_basis: float = 0.0
+    profit_return: float = 0.0
 
 
 class BacktestHoldingSnapshot(BaseModel):
@@ -337,4 +544,8 @@ class StrategyBacktestResponse(BaseModel):
     benchmark_note: str
     data_note: str
     benchmark_curve: list[BacktestPoint] = Field(default_factory=list)
+    selected_industry_ids: list[str] = Field(default_factory=list)
+    universe_size: int = 0
+    industry_allocation: dict[str, float] = Field(default_factory=dict)
+    failures: list[dict[str, str]] = Field(default_factory=list)
     results: list[StrategyBacktestResult]

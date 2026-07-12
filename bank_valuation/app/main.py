@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 from fastapi import FastAPI
 from .routers.bank import router as bank_router
+from .routers.strategy import router as strategy_router
 
 
 def configure_logging() -> None:
@@ -27,11 +28,12 @@ def configure_logging() -> None:
 configure_logging()
 
 app = FastAPI(
-    title="A股银行股估值后端",
-    version="0.1.0",
-    description="估值分析与风险提示服务，不构成投资建议。",
+    title="A股多行业价值与危机防御后端",
+    version="0.2.0",
+    description="银行深度估值、行业分析与跨行业防御策略服务；不构成投资建议。",
 )
 app.include_router(bank_router)
+app.include_router(strategy_router)
 
 
 @app.get("/health")
