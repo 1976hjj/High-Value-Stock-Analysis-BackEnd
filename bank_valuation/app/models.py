@@ -429,6 +429,8 @@ class IndustryAnalysisResponse(BaseModel):
     daily_change_pct: float | None = None
     current_pb: float | None = None
     current_pe: float | None = None
+    pb_percentile_5y: float | None = Field(default=None, ge=0, le=1)
+    pe_percentile_5y: float | None = Field(default=None, ge=0, le=1)
     valuation_metric: Literal["pb", "pe"]
     valuation_percentile: float = Field(ge=0, le=1)
     scores: IndustryAnalysisScores
@@ -498,11 +500,39 @@ class BacktestHolding(BaseModel):
     position_value: float = 0.0
     cost_basis: float = 0.0
     profit_return: float = 0.0
+    dividend_safety_score: float | None = None
+    stable_growth_score: float | None = None
+    quality_score: float | None = None
+    valuation_percentile: float | None = None
+    reversion_potential: float | None = None
 
 
 class BacktestHoldingSnapshot(BaseModel):
     date: date
     holdings: list[BacktestHolding]
+
+
+class BacktestSelectionSnapshot(BaseModel):
+    """Actual candidates and factor values frozen at a scheduled rebalance."""
+    date: date
+    holdings: list[BacktestHolding]
+    candidate_count: int
+    cash_weight: float
+
+
+class BacktestHoldingPriceSeries(BaseModel):
+    """Price path and position facts for a currently held backtest security."""
+    stock_code: str
+    stock_name: str
+    entry_date: date
+    price_curve: list[BacktestPoint]
+    start_price: float
+    entry_price: float
+    current_price: float
+    high_price: float
+    low_price: float
+    price_return: float
+    estimated_shares: float
 
 
 class BacktestMetrics(BaseModel):
@@ -533,6 +563,8 @@ class StrategyBacktestResult(BaseModel):
     yearly_returns: list[BacktestYearReturn]
     current_holdings: list[BacktestHolding]
     holding_snapshots: list[BacktestHoldingSnapshot] = Field(default_factory=list)
+    selection_snapshots: list[BacktestSelectionSnapshot] = Field(default_factory=list)
+    holding_price_series: list[BacktestHoldingPriceSeries] = Field(default_factory=list)
 
 
 class StrategyBacktestResponse(BaseModel):

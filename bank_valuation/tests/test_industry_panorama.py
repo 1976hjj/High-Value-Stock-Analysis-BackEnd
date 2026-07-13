@@ -1,5 +1,6 @@
 from dataclasses import replace
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
 
@@ -63,6 +64,31 @@ def test_consumer_panorama_contains_real_values_and_metric_provenance(snapshot):
     assert metrics["gross_margin"].value == "89.8%"
     assert metrics["dividend_yield"].quality == "derived"
     assert metrics["revenue"].raw_value == pytest.approx(53_909_240_854.0)
+
+
+def test_financial_snapshot_dividend_uses_latest_fiscal_year(monkeypatch):
+    rows = {
+        "dividend 2026": [
+            {"statYear": "2025", "dividOperateDate": "2026-01-16", "dividCashPsBeforeTax": "1.013"},
+            {"statYear": "2025", "dividOperateDate": "2026-07-10", "dividCashPsBeforeTax": "1.003"},
+        ],
+        "dividend 2025": [
+            {"statYear": "2024", "dividOperateDate": "2025-07-11", "dividCashPsBeforeTax": "2.0"},
+        ],
+        "dividend 2024": [],
+    }
+    calls: list[int] = []
+
+    def query_dividend_data(*args, **kwargs):
+        calls.append(kwargs["year"])
+        return object()
+
+    monkeypatch.setattr(financial, "bs", SimpleNamespace(query_dividend_data=query_dividend_data))
+    monkeypatch.setattr(financial, "_rows", lambda query: rows[f"dividend {calls[-1]}"])
+
+    # 2024's annual payout is nearby in calendar time but belongs to the
+    # previous fiscal year, so it cannot turn 2.016 into 4.016.
+    assert financial._query_dividend_ttm("sh.600036", date(2026, 7, 10)) == pytest.approx(2.016)
 
 
 def test_hydro_panorama_marks_water_related_financial_signal_as_proxy(snapshot):

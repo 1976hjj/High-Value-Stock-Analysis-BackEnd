@@ -99,8 +99,8 @@ def _market_metrics(
     earnings_yield = 1 / current_pe if current_pe is not None and current_pe > 0 else None
     market_source = "Baostock 点时行情 + 财务快照计算"
     return [
-        _metric("dividend_cash_ttm", "近12月每股现金分红", snapshot.cash_dividend_ttm, _money_per_share(snapshot.cash_dividend_ttm), _higher(snapshot.cash_dividend_ttm, 0, max(snapshot.cash_dividend_ttm, .5)), "reported", "按估值日前实际实施日期汇总", "Baostock 分红实施记录"),
-        _metric("dividend_yield", "近12月股息率", dividend_yield, _pct(dividend_yield or 0), _higher(dividend_yield or 0, .015, .05), "derived", "以实际实施现金分红除以当前价格", market_source),
+        _metric("dividend_cash_ttm", "最新财年每股现金分红", snapshot.cash_dividend_ttm, _money_per_share(snapshot.cash_dividend_ttm), _higher(snapshot.cash_dividend_ttm, 0, max(snapshot.cash_dividend_ttm, .5)), "reported", "按最新已实施财年汇总中期与年度分红", "Baostock 分红实施记录"),
+        _metric("dividend_yield", "最新财年股息率", dividend_yield, _pct(dividend_yield or 0), _higher(dividend_yield or 0, .015, .05), "derived", "以最新已实施财年现金分红除以当前价格", market_source),
         _metric("pe_ttm", "PE TTM", current_pe, _ratio(current_pe or 0), _lower(current_pe or 0, 12, 35), "reported", "倍数越高，对未来增长和折现率越敏感", "Baostock 日线估值"),
         _metric("pb_mrq", "PB MRQ", current_pb, _ratio(current_pb or 0), _lower(current_pb or 0, 1.2, 6), "reported", "需与 ROE 和资产结构共同解释", "Baostock 日线估值"),
         _metric("valuation_percentile", "近五年估值分位", valuation_percentile, _pct(valuation_percentile), _lower(valuation_percentile, .25, .85), "derived", "分位越高，估值安全垫越薄", "Baostock 五年交易日分位"),

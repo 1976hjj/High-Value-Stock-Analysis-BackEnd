@@ -63,18 +63,26 @@ def analyze_industry_stock(query: IndustryAnalysisQuery) -> IndustryAnalysisResp
     momentum = closes[-1] / closes[0] - 1 if len(closes) > 1 and closes[0] > 0 else 0.0
     stability_score = _clamp(100 - volatility * 150 + drawdown * 35, 0, 100)
 
-    metric_values = [
-        point.pb if industry.valuation_metric == "pb" else point.pe
-        for day, point in ordered
+    five_year_points = [
+        point for day, point in ordered
         if day >= market_date - timedelta(days=365 * 5)
     ]
-    metric_values = [value for value in metric_values if value is not None and value > 0]
-    current_metric = current.pb if industry.valuation_metric == "pb" else current.pe
-    valuation_percentile = (
-        sum(1 for value in metric_values if value <= current_metric) / len(metric_values)
-        if metric_values and current_metric is not None
-        else .5
-    )
+
+    def historical_percentile(field: str) -> float | None:
+        values = [
+            value
+            for point in five_year_points
+            if (value := getattr(point, field)) is not None and value > 0
+        ]
+        current_value = getattr(current, field)
+        if not values or current_value is None or current_value <= 0:
+            return None
+        return sum(1 for value in values if value <= current_value) / len(values)
+
+    pb_percentile_5y = historical_percentile("pb")
+    pe_percentile_5y = historical_percentile("pe")
+    primary_percentile = pb_percentile_5y if industry.valuation_metric == "pb" else pe_percentile_5y
+    valuation_percentile = primary_percentile if primary_percentile is not None else .5
     valuation_score = (1 - valuation_percentile) * 100
     defense_score = profile.defense_score * .72 + stability_score * .28
     quality_score = profile.quality_score * .82 + _clamp(50 + momentum * 60, 0, 100) * .18
@@ -254,6 +262,8 @@ def analyze_industry_stock(query: IndustryAnalysisQuery) -> IndustryAnalysisResp
         daily_change_pct=daily_change,
         current_pb=current.pb,
         current_pe=current.pe,
+        pb_percentile_5y=None if pb_percentile_5y is None else round(pb_percentile_5y, 6),
+        pe_percentile_5y=None if pe_percentile_5y is None else round(pe_percentile_5y, 6),
         valuation_metric=industry.valuation_metric,
         valuation_percentile=round(valuation_percentile, 6),
         scores=IndustryAnalysisScores(

@@ -12,9 +12,11 @@ import statistics
 from ..data_sources.bank_base import BANK_NAMES, _akshare_symbol, _coerce_date, _coerce_positive_float, _market_path
 from ..models import (
     BacktestHolding,
+    BacktestHoldingPriceSeries,
     BacktestHoldingSnapshot,
     BacktestMetrics,
     BacktestPoint,
+    BacktestSelectionSnapshot,
     BacktestYearReturn,
     BankInput,
     StrategyBacktestQuery,
@@ -62,6 +64,11 @@ class Candidate:
     score: float
     dividend_yield: float | None
     risk_score: float
+    dividend_safety_score: float = 0.0
+    stable_growth_score: float = 0.0
+    quality_score: float = 0.0
+    valuation_percentile: float = 0.5
+    reversion_potential: float = 0.0
 
 
 STRATEGIES = {
@@ -104,6 +111,11 @@ def run_strategy_backtest(query: StrategyBacktestQuery) -> StrategyBacktestRespo
         for strategy_id, config in STRATEGIES.items()
     ]
     benchmark_curve = _bank_equal_weight_benchmark(data, dates, query.initial_capital)
+    benchmark_dates = {
+        point.date
+        for result in results
+        for point in result.equity_curve
+    }
     return StrategyBacktestResponse(
         module="bank_strategy_backtest",
         title="银行高股息策略回测",
@@ -116,7 +128,7 @@ def run_strategy_backtest(query: StrategyBacktestQuery) -> StrategyBacktestRespo
             "财务质量、资产质量和资本风险使用最近已披露快照做过滤。它适合先比较策略框架，"
             "严格无未来函数版本需要补齐历史财报公告日、历史分红和历史监管指标。"
         ),
-        benchmark_curve=_sample_curve(benchmark_curve),
+        benchmark_curve=_sample_curve(benchmark_curve, required_dates=benchmark_dates),
         results=results,
     )
 
@@ -278,6 +290,7 @@ def _run_one_strategy(
     weights: dict[str, float] = {}
     previous_prices: dict[str, float] = {}
     entry_dates: dict[str, date] = {}
+    position_cost_bases: dict[str, float] = {}
     position_profits: dict[str, float] = {}
     equity: list[BacktestPoint] = []
     drawdown: list[BacktestPoint] = []
@@ -291,30 +304,42 @@ def _run_one_strategy(
     next_rebalance: date | None = None
     latest_candidates: list[Candidate] = []
     holding_snapshots: list[BacktestHoldingSnapshot] = []
+    selection_snapshots: list[BacktestSelectionSnapshot] = []
 
     for day in dates:
         day_return = 0.0
         day_dividend = 0.0
-        value_before_day = portfolio_value
         invested_weight = sum(weights.values())
+        asset_returns: dict[str, float] = {}
         for code, weight in weights.items():
             point = data[code].market.get(day)
             if point is None:
+                asset_returns[code] = 0.0
                 continue
-            position_return = 0.0
             previous = previous_prices.get(code, point.close)
-            if previous > 0:
-                position_return += weight * (point.close / previous - 1)
+            price_return = point.close / previous - 1 if previous > 0 else 0.0
             dividend_cash = _cash_dividend_on_day(data[code], day)
-            dividend_part = weight * dividend_cash / previous if previous > 0 else 0.0
-            position_return += dividend_part
-            day_return += position_return
+            dividend_return = dividend_cash / previous if previous > 0 else 0.0
+            total_asset_return = price_return + dividend_return
+            asset_returns[code] = total_asset_return
+            day_return += weight * total_asset_return
+            dividend_part = weight * dividend_return
             day_dividend += dividend_part
-            position_profits[code] = position_profits.get(code, 0.0) + value_before_day * position_return
             previous_prices[code] = point.close
         cash_weight = max(0.0, 1 - invested_weight)
         day_return += cash_weight * query.cash_yield / 252
         portfolio_value *= 1 + day_return
+        portfolio_factor = max(1 + day_return, 1e-12)
+        # Let weights drift with total returns between scheduled rebalances.
+        # This avoids assuming an uncharged daily rebalance.
+        weights = {
+            code: weight * (1 + asset_returns.get(code, 0.0)) / portfolio_factor
+            for code, weight in weights.items()
+        }
+        position_profits = {
+            code: portfolio_value * weight - position_cost_bases.get(code, portfolio_value * weight)
+            for code, weight in weights.items()
+        }
         dividend_gain += day_dividend
         daily_returns.append(day_return)
 
@@ -327,10 +352,19 @@ def _run_one_strategy(
                 turnover * (query.commission_rate + query.slippage_rate + query.transfer_fee_rate)
                 + sell_turnover * query.stamp_duty_rate
             )
+            weights_before_rebalance = weights
+            value_before_rebalance_cost = portfolio_value
             cost_amount = portfolio_value * cost
             portfolio_value *= max(0.0, 1 - cost)
             total_transaction_cost += cost_amount
             total_turnover += turnover
+            position_cost_bases = _rebalance_position_cost_bases(
+                position_cost_bases,
+                weights_before_rebalance,
+                new_weights,
+                value_before_rebalance_cost,
+                portfolio_value,
+            )
             weights = new_weights
             for code in list(previous_prices):
                 if code not in weights:
@@ -342,10 +376,29 @@ def _run_one_strategy(
             for code in weights:
                 if code not in entry_dates:
                     entry_dates[code] = day
-                    position_profits[code] = 0.0
                 point = data[code].market.get(day)
                 if point is not None:
                     previous_prices[code] = point.close
+            position_profits = {
+                code: portfolio_value * weight - position_cost_bases[code]
+                for code, weight in weights.items()
+            }
+            selection_snapshots.append(
+                BacktestSelectionSnapshot(
+                    date=day,
+                    holdings=_holdings_from_candidates(
+                        latest_candidates,
+                        weights,
+                        entry_dates,
+                        position_profits,
+                        day,
+                        position_cost_bases,
+                        portfolio_value,
+                    ),
+                    candidate_count=len(latest_candidates),
+                    cash_weight=round(max(0.0, 1 - sum(weights.values())), 6),
+                )
+            )
             rebalance_count += 1
             next_rebalance = _advance_rebalance(day, query.rebalance_frequency)
 
@@ -353,13 +406,20 @@ def _run_one_strategy(
         equity.append(BacktestPoint(date=day, value=round(portfolio_value, 6)))
         drawdown.append(BacktestPoint(date=day, value=round(portfolio_value / peak - 1, 6)))
         transaction_cost_curve.append(BacktestPoint(date=day, value=round(total_transaction_cost, 6)))
-        if weights:
-            holding_snapshots.append(
-                BacktestHoldingSnapshot(
-                    date=day,
-                    holdings=_holdings_from_candidates(latest_candidates, weights, entry_dates, position_profits, day),
-                )
+        holding_snapshots.append(
+            BacktestHoldingSnapshot(
+                date=day,
+                holdings=_holdings_from_candidates(
+                    latest_candidates,
+                    weights,
+                    entry_dates,
+                    position_profits,
+                    day,
+                    position_cost_bases,
+                    portfolio_value,
+                ),
             )
+        )
 
     metrics = _metrics(
         equity=equity,
@@ -372,18 +432,42 @@ def _run_one_strategy(
         rebalance_count=rebalance_count,
     )
     yearly = _yearly_returns(equity)
-    holdings = _holdings_from_candidates(latest_candidates, weights, entry_dates, position_profits, dates[-1])
+    holdings = _holdings_from_candidates(
+        latest_candidates,
+        weights,
+        entry_dates,
+        position_profits,
+        dates[-1],
+        position_cost_bases,
+        portfolio_value,
+    )
+    required_dates = {
+        metrics.max_drawdown_date,
+        *(holding.entry_date for holding in holdings if holding.entry_date is not None),
+    }
+    sampled_equity = _sample_curve(equity, required_dates=required_dates)
+    sampled_drawdown = _sample_curve(drawdown, required_dates=required_dates)
+    sampled_dates = {point.date for point in sampled_equity} | {
+        point.date for point in sampled_drawdown
+    }
+    holding_price_series = _holding_price_series(
+        {code: item.market for code, item in data.items()},
+        holdings,
+        dates,
+    )
     return StrategyBacktestResult(
         strategy_id=strategy_id,  # type: ignore[arg-type]
         strategy_name=str(config["name"]),
         description=str(config["description"]),
         metrics=metrics,
-        equity_curve=_sample_curve(equity),
-        drawdown_curve=_sample_curve(drawdown, required_dates={metrics.max_drawdown_date}),
-        transaction_cost_curve=_sample_curve(transaction_cost_curve),
+        equity_curve=sampled_equity,
+        drawdown_curve=sampled_drawdown,
+        transaction_cost_curve=_sample_curve(transaction_cost_curve, required_dates=sampled_dates),
         yearly_returns=yearly,
         current_holdings=holdings,
-        holding_snapshots=holding_snapshots,
+        holding_snapshots=[snapshot for snapshot in holding_snapshots if snapshot.date in sampled_dates],
+        selection_snapshots=selection_snapshots,
+        holding_price_series=holding_price_series,
     )
 
 
@@ -393,6 +477,8 @@ def _holdings_from_candidates(
     entry_dates: dict[str, date] | None = None,
     position_profits: dict[str, float] | None = None,
     day: date | None = None,
+    position_cost_bases: dict[str, float] | None = None,
+    portfolio_value: float | None = None,
 ) -> list[BacktestHolding]:
     return [
         BacktestHolding(
@@ -405,10 +491,94 @@ def _holdings_from_candidates(
             entry_date=entry_dates.get(item.code) if entry_dates else None,
             holding_days=max(0, (day - entry_dates[item.code]).days) if day and entry_dates and item.code in entry_dates else 0,
             profit=round(position_profits.get(item.code, 0.0), 2) if position_profits else 0.0,
+            position_value=round(portfolio_value * weights.get(item.code, 0.0), 2) if portfolio_value is not None else 0.0,
+            cost_basis=round(position_cost_bases.get(item.code, 0.0), 2) if position_cost_bases else 0.0,
+            profit_return=round(
+                position_profits.get(item.code, 0.0) / position_cost_bases[item.code]
+                if position_profits and position_cost_bases and position_cost_bases.get(item.code, 0.0) > 0
+                else 0.0,
+                6,
+            ),
+            dividend_safety_score=round(item.dividend_safety_score, 2),
+            stable_growth_score=round(item.stable_growth_score, 2),
+            quality_score=round(item.quality_score, 2),
+            valuation_percentile=round(item.valuation_percentile, 6),
+            reversion_potential=round(item.reversion_potential, 6),
         )
         for item in candidates
         if weights.get(item.code, 0.0) > 0
     ]
+
+
+def _holding_price_series(
+    histories: dict[str, dict[date, object]],
+    holdings: list[BacktestHolding],
+    dates: list[date],
+) -> list[BacktestHoldingPriceSeries]:
+    """Return compact, date-aligned price paths for holdings visible in the UI.
+
+    The quantity is a simulated fractional share count: the strategy reinvests
+    cash dividends in the daily total-return calculation, so it is the exact
+    quantity consistent with displayed market value rather than a board-lot
+    trading instruction.
+    """
+    series: list[BacktestHoldingPriceSeries] = []
+    for holding in holdings:
+        history = histories.get(holding.stock_code, {})
+        raw_curve = [
+            BacktestPoint(date=day, value=round(float(getattr(history[day], "close")), 6))
+            for day in dates
+            if day in history and float(getattr(history[day], "close")) > 0
+        ]
+        if not raw_curve:
+            continue
+        entry_date = holding.entry_date or raw_curve[0].date
+        entry_point = next(
+            (point for point in raw_curve if point.date >= entry_date), raw_curve[0]
+        )
+        current_price = raw_curve[-1].value
+        entry_price = entry_point.value
+        series.append(
+            BacktestHoldingPriceSeries(
+                stock_code=holding.stock_code,
+                stock_name=holding.stock_name,
+                entry_date=entry_point.date,
+                price_curve=_sample_curve(
+                    raw_curve,
+                    required_dates={raw_curve[0].date, entry_point.date, raw_curve[-1].date},
+                ),
+                start_price=raw_curve[0].value,
+                entry_price=entry_price,
+                current_price=current_price,
+                high_price=max(point.value for point in raw_curve),
+                low_price=min(point.value for point in raw_curve),
+                price_return=current_price / entry_price - 1 if entry_price > 0 else 0.0,
+                estimated_shares=holding.position_value / current_price if current_price > 0 else 0.0,
+            )
+        )
+    return series
+
+
+def _rebalance_position_cost_bases(
+    current_cost_bases: dict[str, float],
+    current_weights: dict[str, float],
+    target_weights: dict[str, float],
+    portfolio_value_before_cost: float,
+    portfolio_value_after_cost: float,
+) -> dict[str, float]:
+    """Carry remaining average cost through proportional sells and new buys."""
+    next_cost_bases: dict[str, float] = {}
+    for code, target_weight in target_weights.items():
+        target_value = max(0.0, portfolio_value_after_cost * target_weight)
+        current_value = max(0.0, portfolio_value_before_cost * current_weights.get(code, 0.0))
+        current_basis = max(0.0, current_cost_bases.get(code, 0.0))
+        if current_value <= 1e-12 or current_basis <= 1e-12:
+            next_cost_bases[code] = target_value
+        elif target_value >= current_value:
+            next_cost_bases[code] = current_basis + target_value - current_value
+        else:
+            next_cost_bases[code] = current_basis * target_value / current_value
+    return next_cost_bases
 
 
 def _rank_candidates(
@@ -473,7 +643,20 @@ def _rank_candidates(
             if risk > min(query.max_risk_score, 36) or bank.profit_growth_yoy < -.08:
                 continue
             score = base_score + safety * .14 + stable * .12 + quality * .08 - risk * .12
-        candidates.append(Candidate(code=code, name=BANK_NAMES.get(code, bank.stock_name), score=max(0.0, score), dividend_yield=dividend_yield, risk_score=risk))
+        candidates.append(
+            Candidate(
+                code=code,
+                name=BANK_NAMES.get(code, bank.stock_name),
+                score=max(0.0, score),
+                dividend_yield=dividend_yield,
+                risk_score=risk,
+                dividend_safety_score=safety,
+                stable_growth_score=stable,
+                quality_score=quality,
+                valuation_percentile=pb_percentile,
+                reversion_potential=reversion,
+            )
+        )
     return sorted(candidates, key=lambda item: item.score, reverse=True)
 
 
@@ -495,19 +678,17 @@ def _target_weights(strategy_id: str, candidates: list[Candidate], target_count:
 
 
 def _historical_dividend_yield(item: BankBacktestData, price: float, day: date) -> float | None:
+    """Return the yield of the latest completed fiscal year's cash dividend.
+
+    Do not use a rolling 365-day payment window here.  For companies that pay
+    an annual dividend around the same time as the following year's interim
+    dividend, that window can contain parts of two fiscal years and materially
+    overstate the recurring yield (招商银行 was one such case).
+    """
     if price <= 0 or not item.dividends:
         return None
-    start = day - timedelta(days=365)
-    dividend_per_share = sum(
-        event.cash_per_share
-        for event in _deduplicate_implemented_dividends(item.dividends)
-        if (
-            event.ex_dividend_date is not None
-            and start < event.ex_dividend_date <= day
-            and event.announcement_date <= day
-        )
-    )
-    return min(dividend_per_share / price, 0.15)
+    dividend_per_share = _latest_implemented_fiscal_year_dividend(item.dividends, day)
+    return dividend_per_share / price if dividend_per_share is not None else None
 
 
 def _deduplicate_implemented_dividends(events: list[DividendEvent]) -> list[DividendEvent]:
@@ -522,13 +703,20 @@ def _deduplicate_implemented_dividends(events: list[DividendEvent]) -> list[Divi
     return list(unique.values())
 
 
-def _announced_fiscal_year_dividend(item: BankBacktestData, day: date) -> float:
+def _latest_implemented_fiscal_year_dividend(
+    events: list[DividendEvent], day: date
+) -> float | None:
+    """Sum paid dividends for the latest fiscal year available on ``day``."""
     yearly_cash: dict[int, float] = {}
-    for event in item.dividends:
-        if event.announcement_date <= day:
+    for event in _deduplicate_implemented_dividends(events):
+        if (
+            event.ex_dividend_date is not None
+            and event.ex_dividend_date <= day
+            and event.announcement_date <= day
+        ):
             yearly_cash[event.report_date.year] = yearly_cash.get(event.report_date.year, 0.0) + event.cash_per_share
     if not yearly_cash:
-        return 0.0
+        return None
     return yearly_cash[max(yearly_cash)]
 
 

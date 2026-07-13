@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, timedelta
 
 import pytest
@@ -38,6 +39,7 @@ def _query(
     max_industry_weight: float | None = None,
     crisis_cash_buffer: float = 0.1,
     holding_count: int | None = None,
+    rebalance_frequency: str = "quarterly",
 ) -> CrossIndustryStrategyBacktestQuery:
     mode = universe_mode or ("single" if len(industry_ids) == 1 else "selected")
     cap = max_industry_weight
@@ -50,6 +52,7 @@ def _query(
         max_industry_weight=cap,
         crisis_cash_buffer=crisis_cash_buffer,
         holding_count=holding_count or max(3, len(industry_ids)),
+        rebalance_frequency=rebalance_frequency,
         start_date=days[0],
         end_date=days[-1],
         min_dividend_yield=0.0,
@@ -290,7 +293,7 @@ def test_china_oil_like_total_return_cannot_create_oversized_current_profit():
     assert current_value - entry_value < 65_000
 
 
-def test_trailing_dividend_yield_uses_implemented_ttm_cash_once():
+def test_dividend_yield_uses_implemented_latest_fiscal_year_cash_once():
     profile = profiles_for_industries(["oilgas"])[0]
     day = date(2026, 7, 10)
     event = cross.DividendEvent(
@@ -316,6 +319,24 @@ def test_trailing_dividend_yield_uses_implemented_ttm_cash_once():
     assert len(item.dividends) == 1
     assert cross._trailing_dividend_yield(item, day) == pytest.approx(0.02)
     assert cross._cash_dividend_on_day(item.dividends, day) == pytest.approx(0.5)
+
+
+def test_dividend_yield_does_not_mix_cash_from_two_fiscal_years():
+    profile = profiles_for_industries(["oilgas"])[0]
+    day = date(2026, 7, 10)
+    item = cross.CrossBacktestData(
+        profile=profile,
+        market={day: SecurityMarketPoint(close=36.0, pb=1.0, pe=10.0)},
+        raw_market={day: SecurityMarketPoint(close=40.16, pb=1.0, pe=10.0)},
+        dividends=[
+            cross.DividendEvent(date(2024, 12, 31), date(2025, 3, 26), date(2025, 7, 11), 2.0),
+            cross.DividendEvent(date(2025, 6, 30), date(2025, 12, 30), date(2026, 1, 16), 1.013),
+            cross.DividendEvent(date(2025, 12, 31), date(2026, 3, 28), day, 1.003),
+        ],
+        dividend_data_available=True,
+    )
+
+    assert cross._trailing_dividend_yield(item, day) == pytest.approx(2.016 / 40.16)
 
 
 def test_trailing_dividend_yield_returns_none_when_source_is_unavailable():
@@ -469,3 +490,91 @@ def test_crisis_cash_buffer_reduces_a_common_price_shock(monkeypatch):
 
     assert with_buffer.results[0].equity_curve[-1].value == pytest.approx(60.0)
     assert without_buffer.results[0].equity_curve[-1].value == pytest.approx(50.0)
+
+
+def _direct_cross_data(code: str, days: list[date], prices: list[float]) -> cross.CrossBacktestData:
+    profile = replace(profiles_for_industries(["telecom"])[0], code=code, name=code)
+    market = {
+        day: SecurityMarketPoint(close=price, pb=1.0, pe=10.0)
+        for day, price in zip(days, prices, strict=True)
+    }
+    return cross.CrossBacktestData(
+        profile=profile,
+        market=market,
+        raw_market=market,
+        dividends=[],
+        dividend_data_available=True,
+    )
+
+
+def _candidate(code: str) -> cross.CrossCandidate:
+    return cross.CrossCandidate(
+        code=code,
+        name=code,
+        industry_id="telecom",
+        score=90.0,
+        dividend_yield=0.0,
+        risk_score=10.0,
+        volatility=0.1,
+    )
+
+
+def test_cross_snapshots_are_as_of_each_chart_date_and_keep_daily_profit(monkeypatch):
+    days = [date(2025, 1, 1), date(2025, 1, 2), date(2025, 1, 3)]
+    data = {"A": _direct_cross_data("A", days, [10.0, 11.0, 11.0])}
+    monkeypatch.setattr(cross, "_rank_candidates", lambda *_args: [_candidate("A")])
+
+    result = cross._run_one_strategy(
+        "income_core",
+        {"name": "test", "description": "test"},
+        data,
+        days,
+        _query(["telecom"], days, rebalance_frequency="monthly"),
+    )
+
+    snapshots = {snapshot.date: snapshot for snapshot in result.holding_snapshots}
+    assert set(snapshots) == set(days)
+    holding = snapshots[days[1]].holdings[0]
+    assert holding.entry_date == days[0]
+    assert holding.holding_days == 1
+    assert holding.position_value == pytest.approx(99.0)
+    assert holding.cost_basis == pytest.approx(90.0)
+    assert holding.profit == pytest.approx(9.0)
+    assert holding.profit_return == pytest.approx(0.1)
+
+
+def test_cross_rebalance_snapshot_uses_selection_available_on_that_day(monkeypatch):
+    days = [date(2025, 1, 31), date(2025, 2, 1), date(2025, 2, 2)]
+    data = {
+        "A": _direct_cross_data("A", days, [10.0, 10.0, 10.0]),
+        "B": _direct_cross_data("B", days, [10.0, 10.0, 10.0]),
+    }
+
+    def fake_rank(_strategy_id, _data, day, _query):
+        return [_candidate("A" if day == days[0] else "B")]
+
+    monkeypatch.setattr(cross, "_rank_candidates", fake_rank)
+    result = cross._run_one_strategy(
+        "income_core",
+        {"name": "test", "description": "test"},
+        data,
+        days,
+        _query(["telecom"], days, rebalance_frequency="monthly"),
+    )
+
+    snapshots = {snapshot.date: snapshot for snapshot in result.holding_snapshots}
+    assert [holding.stock_code for holding in snapshots[days[0]].holdings] == ["A"]
+    replacement = snapshots[days[1]].holdings[0]
+    assert replacement.stock_code == "B"
+    assert replacement.entry_date == days[1]
+    assert replacement.holding_days == 0
+    assert replacement.profit == 0.0
+
+
+def test_cross_valuation_percentile_excludes_future_market_data():
+    days = [date(2025, 1, 1), date(2025, 1, 2), date(2025, 1, 3)]
+    item = _direct_cross_data("A", days, [10.0, 20.0, 1.0])
+
+    # Telecom uses PE. On 1/2, 20 is the maximum of the two known values;
+    # the later value of 1 must not enter the denominator or ranking signal.
+    assert cross._valuation_percentile(item, days[1]) == pytest.approx(1.0)

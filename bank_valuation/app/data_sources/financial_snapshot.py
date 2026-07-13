@@ -128,11 +128,17 @@ def _revenue(row: dict[str, str] | None) -> float | None:
 
 
 def _query_dividend_ttm(code: str, valuation_date: date) -> float:
-    start = valuation_date - timedelta(days=365)
-    total = 0.0
+    """Return paid cash dividends for the latest available fiscal year.
+
+    The persisted field keeps its original API name for compatibility.  A
+    payment-date rolling window is deliberately not used: it may span two
+    fiscal years when an annual payout and the next interim payout are close
+    together, which inflates the displayed recurring dividend yield.
+    """
+    yearly_cash: dict[int, float] = {}
     seen: set[tuple[str, float]] = set()
-    for year in range(valuation_date.year, valuation_date.year - 3, -1):
-        for row in _rows(bs.query_dividend_data(code, year=year, yearType="report")):
+    for requested_year in range(valuation_date.year, valuation_date.year - 3, -1):
+        for row in _rows(bs.query_dividend_data(code, year=requested_year, yearType="report")):
             cash = _number(row.get("dividCashPsBeforeTax"))
             raw_date = row.get("dividOperateDate") or row.get("dividPayDate") or row.get("dividPlanDate")
             if cash is None or cash <= 0 or not raw_date:
@@ -142,10 +148,17 @@ def _query_dividend_ttm(code: str, valuation_date: date) -> float:
             except ValueError:
                 continue
             marker = (effective_date.isoformat(), cash)
-            if start < effective_date <= valuation_date and marker not in seen:
-                total += cash
+            if effective_date <= valuation_date and marker not in seen:
+                fiscal_year = requested_year
+                for key in ("statYear", "year", "dividYear"):
+                    try:
+                        fiscal_year = int(float(row[key]))
+                        break
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                yearly_cash[fiscal_year] = yearly_cash.get(fiscal_year, 0.0) + cash
                 seen.add(marker)
-    return total
+    return yearly_cash[max(yearly_cash)] if yearly_cash else 0.0
 
 
 _DATASETS: dict[str, Callable[..., Any]] = {
