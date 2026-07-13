@@ -497,6 +497,8 @@ class BacktestHolding(BaseModel):
     entry_date: date | None = None
     holding_days: int = 0
     profit: float = 0.0
+    price_profit: float = 0.0
+    dividend_profit: float = 0.0
     position_value: float = 0.0
     cost_basis: float = 0.0
     profit_return: float = 0.0

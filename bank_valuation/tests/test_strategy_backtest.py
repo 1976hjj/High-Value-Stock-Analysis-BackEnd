@@ -248,6 +248,10 @@ def test_holding_profit_includes_own_cash_dividend(monkeypatch):
     assert profits["A"] == 3.33
     assert profits["B"] == 0.0
     assert profits["C"] == 0.0
+    holding = next(item for item in result.holding_snapshots[-1].holdings if item.stock_code == "A")
+    assert holding.price_profit == 0.0
+    assert holding.dividend_profit == 3.33
+    assert holding.profit == pytest.approx(holding.price_profit + holding.dividend_profit)
 
 
 def test_reentered_holding_does_not_capture_gain_while_out_of_portfolio(monkeypatch):
@@ -367,6 +371,10 @@ def test_ex_dividend_price_drop_and_cash_dividend_are_counted_exactly_once(monke
     # -10% price return plus +10% cash return leaves the portfolio unchanged;
     # a duplicated dividend would incorrectly increase it.
     assert result.equity_curve[-1].value == pytest.approx(100.0)
+    holding = next(item for item in result.current_holdings if item.stock_code == "A")
+    assert holding.price_profit == -3.33
+    assert holding.dividend_profit == 3.33
+    assert holding.profit == pytest.approx(holding.price_profit + holding.dividend_profit)
 
 
 def test_missing_dividend_history_does_not_fall_back_to_current_bank_value():

@@ -212,6 +212,7 @@ def _run_one_strategy(
     entry_dates: dict[str, date] = {}
     position_cost_bases: dict[str, float] = {}
     position_profits: dict[str, float] = {}
+    position_dividend_profits: dict[str, float] = {}
     equity: list[BacktestPoint] = []
     drawdown: list[BacktestPoint] = []
     transaction_cost_curve: list[BacktestPoint] = []
@@ -247,7 +248,12 @@ def _run_one_strategy(
             if dividend_cash > 0 and raw_previous is not None and raw_previous > 0:
                 # Post-adjusted prices already contain the dividend return. This
                 # is attribution only and is deliberately not added to day_return.
-                estimated_dividend_gain += weight * dividend_cash / raw_previous
+                dividend_return = dividend_cash / raw_previous
+                estimated_dividend_gain += weight * dividend_return
+                position_dividend_profits[code] = (
+                    position_dividend_profits.get(code, 0.0)
+                    + value_before_day * weight * dividend_return
+                )
         cash_weight = max(0.0, 1 - invested_weight)
         cash_return = query.cash_yield / 252
         day_return += cash_weight * cash_return
@@ -294,6 +300,13 @@ def _run_one_strategy(
                 value_before_rebalance_cost,
                 portfolio_value,
             )
+            position_dividend_profits = _rebalance_position_dividend_profits(
+                position_dividend_profits,
+                weights_before_rebalance,
+                new_weights,
+                value_before_rebalance_cost,
+                portfolio_value,
+            )
             weights = new_weights
             for code in list(previous_prices):
                 if code not in weights:
@@ -302,6 +315,7 @@ def _run_one_strategy(
                 if code not in weights:
                     entry_dates.pop(code, None)
                     position_profits.pop(code, None)
+                    position_dividend_profits.pop(code, None)
             for code in weights:
                 if code not in entry_dates:
                     entry_dates[code] = day
@@ -324,6 +338,7 @@ def _run_one_strategy(
                         position_cost_bases,
                         portfolio_value,
                         day,
+                        position_dividend_profits,
                     ),
                     candidate_count=len(latest_candidates),
                     cash_weight=round(max(0.0, 1 - sum(weights.values())), 6),
@@ -348,6 +363,7 @@ def _run_one_strategy(
                     position_cost_bases,
                     portfolio_value,
                     day,
+                    position_dividend_profits,
                 ),
             )
         )
@@ -371,6 +387,7 @@ def _run_one_strategy(
         position_cost_bases,
         portfolio_value,
         dates[-1],
+        position_dividend_profits,
     )
     required_dates = {
         metrics.max_drawdown_date,
@@ -637,6 +654,7 @@ def _holdings_from_candidates(
     position_cost_bases: dict[str, float],
     portfolio_value: float,
     day: date,
+    position_dividend_profits: dict[str, float],
 ) -> list[BacktestHolding]:
     return [
         BacktestHolding(
@@ -650,6 +668,11 @@ def _holdings_from_candidates(
             entry_date=entry_dates.get(item.code),
             holding_days=max(0, (day - entry_dates[item.code]).days) if item.code in entry_dates else 0,
             profit=round(position_profits.get(item.code, 0.0), 2),
+            price_profit=round(
+                position_profits.get(item.code, 0.0) - position_dividend_profits.get(item.code, 0.0),
+                2,
+            ),
+            dividend_profit=round(position_dividend_profits.get(item.code, 0.0), 2),
             position_value=round(portfolio_value * weights[item.code], 2),
             cost_basis=round(position_cost_bases.get(item.code, 0.0), 2),
             profit_return=round(
@@ -688,6 +711,27 @@ def _rebalance_position_cost_bases(
         else:
             next_cost_bases[code] = current_basis * target_value / current_value
     return next_cost_bases
+
+
+def _rebalance_position_dividend_profits(
+    current_dividend_profits: dict[str, float],
+    current_weights: dict[str, float],
+    target_weights: dict[str, float],
+    portfolio_value_before_cost: float,
+    portfolio_value_after_cost: float,
+) -> dict[str, float]:
+    next_dividend_profits: dict[str, float] = {}
+    for code, target_weight in target_weights.items():
+        current_value = max(0.0, portfolio_value_before_cost * current_weights.get(code, 0.0))
+        target_value = max(0.0, portfolio_value_after_cost * target_weight)
+        existing = current_dividend_profits.get(code, 0.0)
+        if current_value <= 1e-12:
+            next_dividend_profits[code] = 0.0
+        elif target_value >= current_value:
+            next_dividend_profits[code] = existing
+        else:
+            next_dividend_profits[code] = existing * target_value / current_value
+    return next_dividend_profits
 
 
 def _load_dividend_histories(
