@@ -554,6 +554,34 @@ class BacktestMetrics(BaseModel):
     total_transaction_cost: float = 0.0
 
 
+class BacktestStockProfitContribution(BaseModel):
+    """One security's realized contribution inside a reporting period."""
+    stock_code: str
+    stock_name: str
+    industry_id: str | None = None
+    net_profit: float
+    price_profit: float
+    dividend_profit: float
+    transaction_cost: float
+    return_contribution: float
+
+
+class BacktestProfitContributionPeriod(BaseModel):
+    """A reconciled calendar-year or full-backtest stock contribution ledger."""
+    period_type: Literal["year", "total"]
+    year: int | None = None
+    start_date: date
+    end_date: date
+    start_value: float
+    end_value: float
+    net_profit: float
+    stock_net_profit: float
+    cash_profit: float
+    return_rate: float
+    reconciliation_error: float
+    stocks: list[BacktestStockProfitContribution] = Field(default_factory=list)
+
+
 class StrategyBacktestResult(BaseModel):
     strategy_id: Literal["income_core", "value_reversion", "defensive_rotation"]
     strategy_name: str
@@ -567,6 +595,8 @@ class StrategyBacktestResult(BaseModel):
     holding_snapshots: list[BacktestHoldingSnapshot] = Field(default_factory=list)
     selection_snapshots: list[BacktestSelectionSnapshot] = Field(default_factory=list)
     holding_price_series: list[BacktestHoldingPriceSeries] = Field(default_factory=list)
+    yearly_profit_contributions: list[BacktestProfitContributionPeriod] = Field(default_factory=list)
+    total_profit_contribution: BacktestProfitContributionPeriod | None = None
 
 
 class StrategyBacktestResponse(BaseModel):

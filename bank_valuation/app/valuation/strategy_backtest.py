@@ -16,7 +16,9 @@ from ..models import (
     BacktestHoldingSnapshot,
     BacktestMetrics,
     BacktestPoint,
+    BacktestProfitContributionPeriod,
     BacktestSelectionSnapshot,
+    BacktestStockProfitContribution,
     BacktestYearReturn,
     BankInput,
     StrategyBacktestQuery,
@@ -69,6 +71,19 @@ class Candidate:
     quality_score: float = 0.0
     valuation_percentile: float = 0.5
     reversion_potential: float = 0.0
+
+
+@dataclass
+class _StockProfitBucket:
+    price_profit: float = 0.0
+    dividend_profit: float = 0.0
+    transaction_cost: float = 0.0
+
+
+@dataclass(frozen=True)
+class _StockProfitMeta:
+    name: str
+    industry_id: str | None = None
 
 
 STRATEGIES = {
@@ -306,6 +321,15 @@ def _run_one_strategy(
     latest_candidates: list[Candidate] = []
     holding_snapshots: list[BacktestHoldingSnapshot] = []
     selection_snapshots: list[BacktestSelectionSnapshot] = []
+    stock_profit_ledger: dict[date, dict[str, _StockProfitBucket]] = {}
+    cash_profit_ledger: dict[date, float] = {}
+    stock_profit_meta = {
+        code: _StockProfitMeta(
+            name=BANK_NAMES.get(code, item.bank.stock_name),
+            industry_id="bank",
+        )
+        for code, item in data.items()
+    }
 
     for day in dates:
         day_return = 0.0
@@ -327,13 +351,22 @@ def _run_one_strategy(
             day_return += weight * total_asset_return
             dividend_part = weight * dividend_return
             day_dividend += dividend_part
+            _record_stock_profit(
+                stock_profit_ledger,
+                day,
+                code,
+                price_profit=value_before_day * weight * price_return,
+                dividend_profit=value_before_day * dividend_part,
+            )
             position_dividend_profits[code] = (
                 position_dividend_profits.get(code, 0.0)
                 + value_before_day * dividend_part
             )
             previous_prices[code] = point.close
         cash_weight = max(0.0, 1 - invested_weight)
-        day_return += cash_weight * query.cash_yield / 252
+        cash_return = cash_weight * query.cash_yield / 252
+        day_return += cash_return
+        cash_profit_ledger[day] = value_before_day * cash_return
         portfolio_value *= 1 + day_return
         portfolio_factor = max(1 + day_return, 1e-12)
         # Let weights drift with total returns between scheduled rebalances.
@@ -361,6 +394,26 @@ def _run_one_strategy(
             weights_before_rebalance = weights
             value_before_rebalance_cost = portfolio_value
             cost_amount = portfolio_value * cost
+            for code in set(new_weights) | set(weights_before_rebalance):
+                traded_weight = abs(
+                    new_weights.get(code, 0.0) - weights_before_rebalance.get(code, 0.0)
+                )
+                sold_weight = max(
+                    weights_before_rebalance.get(code, 0.0) - new_weights.get(code, 0.0),
+                    0.0,
+                )
+                allocated_cost = value_before_rebalance_cost * (
+                    traded_weight
+                    * (query.commission_rate + query.slippage_rate + query.transfer_fee_rate)
+                    + sold_weight * query.stamp_duty_rate
+                )
+                if allocated_cost > 0:
+                    _record_stock_profit(
+                        stock_profit_ledger,
+                        day,
+                        code,
+                        transaction_cost=allocated_cost,
+                    )
             portfolio_value *= max(0.0, 1 - cost)
             total_transaction_cost += cost_amount
             total_turnover += turnover
@@ -446,8 +499,9 @@ def _run_one_strategy(
         total_turnover=total_turnover,
         total_transaction_cost=total_transaction_cost,
         rebalance_count=rebalance_count,
+        initial_value=query.initial_capital,
     )
-    yearly = _yearly_returns(equity)
+    yearly = _yearly_returns(equity, initial_value=query.initial_capital)
     holdings = _holdings_from_candidates(
         latest_candidates,
         weights,
@@ -472,6 +526,13 @@ def _run_one_strategy(
         holdings,
         dates,
     )
+    yearly_profit_contributions, total_profit_contribution = _profit_contribution_periods(
+        equity=equity,
+        initial_value=query.initial_capital,
+        stock_ledger=stock_profit_ledger,
+        cash_ledger=cash_profit_ledger,
+        stock_meta=stock_profit_meta,
+    )
     return StrategyBacktestResult(
         strategy_id=strategy_id,  # type: ignore[arg-type]
         strategy_name=str(config["name"]),
@@ -485,6 +546,8 @@ def _run_one_strategy(
         holding_snapshots=[snapshot for snapshot in holding_snapshots if snapshot.date in sampled_dates],
         selection_snapshots=selection_snapshots,
         holding_price_series=holding_price_series,
+        yearly_profit_contributions=yearly_profit_contributions,
+        total_profit_contribution=total_profit_contribution,
     )
 
 
@@ -797,6 +860,97 @@ def _advance_rebalance(day: date, frequency: str) -> date:
     return date(year, month, 1)
 
 
+def _record_stock_profit(
+    ledger: dict[date, dict[str, _StockProfitBucket]],
+    day: date,
+    code: str,
+    *,
+    price_profit: float = 0.0,
+    dividend_profit: float = 0.0,
+    transaction_cost: float = 0.0,
+) -> None:
+    bucket = ledger.setdefault(day, {}).setdefault(code, _StockProfitBucket())
+    bucket.price_profit += price_profit
+    bucket.dividend_profit += dividend_profit
+    bucket.transaction_cost += transaction_cost
+
+
+def _profit_contribution_periods(
+    *,
+    equity: list[BacktestPoint],
+    initial_value: float,
+    stock_ledger: dict[date, dict[str, _StockProfitBucket]],
+    cash_ledger: dict[date, float],
+    stock_meta: dict[str, _StockProfitMeta],
+) -> tuple[list[BacktestProfitContributionPeriod], BacktestProfitContributionPeriod]:
+    """Build ledgers that reconcile stock, cash and portfolio profit exactly."""
+    ordered_equity = sorted(equity, key=lambda point: point.date)
+    by_year: dict[int, list[BacktestPoint]] = {}
+    for point in ordered_equity:
+        by_year.setdefault(point.date.year, []).append(point)
+
+    def build_period(
+        period_type: str,
+        points: list[BacktestPoint],
+        start_value: float,
+        year: int | None = None,
+    ) -> BacktestProfitContributionPeriod:
+        period_dates = {point.date for point in points}
+        totals: dict[str, _StockProfitBucket] = {}
+        for day in period_dates:
+            for code, value in stock_ledger.get(day, {}).items():
+                bucket = totals.setdefault(code, _StockProfitBucket())
+                bucket.price_profit += value.price_profit
+                bucket.dividend_profit += value.dividend_profit
+                bucket.transaction_cost += value.transaction_cost
+        stocks: list[BacktestStockProfitContribution] = []
+        for code, bucket in totals.items():
+            net_profit = bucket.price_profit + bucket.dividend_profit - bucket.transaction_cost
+            meta = stock_meta.get(code, _StockProfitMeta(code))
+            stocks.append(
+                BacktestStockProfitContribution(
+                    stock_code=code,
+                    stock_name=meta.name,
+                    industry_id=meta.industry_id,
+                    net_profit=round(net_profit, 2),
+                    price_profit=round(bucket.price_profit, 2),
+                    dividend_profit=round(bucket.dividend_profit, 2),
+                    transaction_cost=round(bucket.transaction_cost, 2),
+                    return_contribution=round(net_profit / start_value if start_value else 0.0, 6),
+                )
+            )
+        stocks.sort(key=lambda item: (item.net_profit, item.stock_code), reverse=True)
+        end_value = points[-1].value
+        net_profit = end_value - start_value
+        stock_net_profit = sum(
+            bucket.price_profit + bucket.dividend_profit - bucket.transaction_cost
+            for bucket in totals.values()
+        )
+        cash_profit = sum(cash_ledger.get(day, 0.0) for day in period_dates)
+        return BacktestProfitContributionPeriod(
+            period_type=period_type,  # type: ignore[arg-type]
+            year=year,
+            start_date=points[0].date,
+            end_date=points[-1].date,
+            start_value=round(start_value, 2),
+            end_value=round(end_value, 2),
+            net_profit=round(net_profit, 2),
+            stock_net_profit=round(stock_net_profit, 2),
+            cash_profit=round(cash_profit, 2),
+            return_rate=round(net_profit / start_value if start_value else 0.0, 6),
+            reconciliation_error=round(net_profit - stock_net_profit - cash_profit, 6),
+            stocks=stocks,
+        )
+
+    yearly: list[BacktestProfitContributionPeriod] = []
+    period_start_value = initial_value
+    for year, points in sorted(by_year.items()):
+        yearly.append(build_period("year", points, period_start_value, year))
+        period_start_value = points[-1].value
+    total = build_period("total", ordered_equity, initial_value)
+    return yearly, total
+
+
 def _metrics(
     *,
     equity: list[BacktestPoint],
@@ -829,7 +983,7 @@ def _metrics(
     volatility = statistics.pstdev(daily_returns) * math.sqrt(252) if len(daily_returns) > 1 else 0.0
     sharpe = None if volatility == 0 else (annualized - cash_yield) / volatility
     calmar = None if max_drawdown == 0 else annualized / abs(max_drawdown)
-    yearly = _yearly_returns(equity)
+    yearly = _yearly_returns(equity, initial_value=start_value)
     win_year_rate = sum(1 for item in yearly if item.return_rate > 0) / len(yearly) if yearly else 0.0
     annual_dividend = dividend_gain / max(days / 365, 1)
     return BacktestMetrics(
@@ -850,15 +1004,33 @@ def _metrics(
     )
 
 
-def _yearly_returns(equity: list[BacktestPoint]) -> list[BacktestYearReturn]:
+def _yearly_returns(
+    equity: list[BacktestPoint],
+    initial_value: float | None = None,
+) -> list[BacktestYearReturn]:
     by_year: dict[int, list[BacktestPoint]] = {}
-    for point in equity:
+    for point in sorted(equity, key=lambda item: item.date):
         by_year.setdefault(point.date.year, []).append(point)
-    output = []
+    output: list[BacktestYearReturn] = []
+    previous_year_end: float | None = None
     for year, points in sorted(by_year.items()):
-        if len(points) < 2:
-            continue
-        output.append(BacktestYearReturn(year=year, return_rate=round(points[-1].value / points[0].value - 1, 6)))
+        # A calendar year's return starts at the preceding year's final net
+        # asset value.  Using the first point inside the year silently drops
+        # the first trading day's gain/loss.  Only the first partial year has
+        # no preceding observation and therefore uses its own first point.
+        start_value = (
+            previous_year_end
+            if previous_year_end is not None
+            else initial_value if initial_value is not None else points[0].value
+        )
+        if previous_year_end is not None or initial_value is not None or len(points) >= 2:
+            output.append(
+                BacktestYearReturn(
+                    year=year,
+                    return_rate=round(points[-1].value / start_value - 1, 6),
+                )
+            )
+        previous_year_end = points[-1].value
     return output
 
 

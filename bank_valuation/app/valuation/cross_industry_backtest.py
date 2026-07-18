@@ -38,8 +38,12 @@ from .strategy_backtest import (
     _fetch_dividend_events,
     _metrics,
     _holding_price_series,
+    _profit_contribution_periods,
     _read_dividend_events,
+    _record_stock_profit,
     _sample_curve,
+    _StockProfitBucket,
+    _StockProfitMeta,
     _write_dividend_events_cache,
     _yearly_returns,
 )
@@ -226,6 +230,15 @@ def _run_one_strategy(
     latest_candidates: list[CrossCandidate] = []
     holding_snapshots: list[BacktestHoldingSnapshot] = []
     selection_snapshots: list[BacktestSelectionSnapshot] = []
+    stock_profit_ledger: dict[date, dict[str, _StockProfitBucket]] = {}
+    cash_profit_ledger: dict[date, float] = {}
+    stock_profit_meta = {
+        code: _StockProfitMeta(
+            name=item.profile.name,
+            industry_id=item.profile.industry_id,
+        )
+        for code, item in data.items()
+    }
 
     for index, day in enumerate(dates):
         day_return = 0.0
@@ -243,6 +256,8 @@ def _run_one_strategy(
             position_return = weight * asset_return
             day_return += position_return
             previous_prices[code] = point.close
+            stock_profit_amount = value_before_day * position_return
+            dividend_profit_amount = 0.0
             dividend_cash = _cash_dividend_on_day(data[code].dividends, day)
             raw_previous = _market_price_at_or_before(data[code].raw_market, day - timedelta(days=1))
             if dividend_cash > 0 and raw_previous is not None and raw_previous > 0:
@@ -250,13 +265,22 @@ def _run_one_strategy(
                 # is attribution only and is deliberately not added to day_return.
                 dividend_return = dividend_cash / raw_previous
                 estimated_dividend_gain += weight * dividend_return
+                dividend_profit_amount = value_before_day * weight * dividend_return
                 position_dividend_profits[code] = (
                     position_dividend_profits.get(code, 0.0)
-                    + value_before_day * weight * dividend_return
+                    + dividend_profit_amount
                 )
+            _record_stock_profit(
+                stock_profit_ledger,
+                day,
+                code,
+                price_profit=stock_profit_amount - dividend_profit_amount,
+                dividend_profit=dividend_profit_amount,
+            )
         cash_weight = max(0.0, 1 - invested_weight)
         cash_return = query.cash_yield / 252
         day_return += cash_weight * cash_return
+        cash_profit_ledger[day] = value_before_day * cash_weight * cash_return
         portfolio_value *= 1 + day_return
         portfolio_factor = max(1 + day_return, 1e-12)
         # Let positions drift naturally between scheduled rebalances. This
@@ -290,6 +314,26 @@ def _run_one_strategy(
             weights_before_rebalance = weights
             value_before_rebalance_cost = portfolio_value
             cost_amount = portfolio_value * cost
+            for code in set(new_weights) | set(weights_before_rebalance):
+                traded_weight = abs(
+                    new_weights.get(code, 0.0) - weights_before_rebalance.get(code, 0.0)
+                )
+                sold_weight = max(
+                    weights_before_rebalance.get(code, 0.0) - new_weights.get(code, 0.0),
+                    0.0,
+                )
+                allocated_cost = value_before_rebalance_cost * (
+                    traded_weight
+                    * (query.commission_rate + query.slippage_rate + query.transfer_fee_rate)
+                    + sold_weight * query.stamp_duty_rate
+                )
+                if allocated_cost > 0:
+                    _record_stock_profit(
+                        stock_profit_ledger,
+                        day,
+                        code,
+                        transaction_cost=allocated_cost,
+                    )
             portfolio_value *= max(0.0, 1 - cost)
             total_transaction_cost += cost_amount
             total_turnover += turnover
@@ -402,9 +446,22 @@ def _run_one_strategy(
         snapshot for snapshot in holding_snapshots if snapshot.date in sampled_dates
     ]
     holding_price_series = _holding_price_series(
-        {code: item.market for code, item in data.items()},
+        # The strategy return engine intentionally uses post-adjusted closes,
+        # but prices shown to users must remain actual traded closes.  A
+        # post-adjusted value can be tens or hundreds of times the stock price
+        # after years of dividends/splits (for example, 600887 was displayed
+        # around 2,200 instead of 26), which makes the entry/current price and
+        # simulated share count meaningless.
+        {code: item.raw_market for code, item in data.items()},
         holdings,
         dates,
+    )
+    yearly_profit_contributions, total_profit_contribution = _profit_contribution_periods(
+        equity=equity,
+        initial_value=query.initial_capital,
+        stock_ledger=stock_profit_ledger,
+        cash_ledger=cash_profit_ledger,
+        stock_meta=stock_profit_meta,
     )
     return StrategyBacktestResult(
         strategy_id=strategy_id,  # type: ignore[arg-type]
@@ -414,11 +471,13 @@ def _run_one_strategy(
         equity_curve=sampled_equity,
         drawdown_curve=sampled_drawdown,
         transaction_cost_curve=_sample_curve(transaction_cost_curve, required_dates=sampled_dates),
-        yearly_returns=_yearly_returns(equity),
+        yearly_returns=_yearly_returns(equity, initial_value=query.initial_capital),
         current_holdings=holdings,
         holding_snapshots=sampled_snapshots,
         selection_snapshots=selection_snapshots,
         holding_price_series=holding_price_series,
+        yearly_profit_contributions=yearly_profit_contributions,
+        total_profit_contribution=total_profit_contribution,
     )
 
 

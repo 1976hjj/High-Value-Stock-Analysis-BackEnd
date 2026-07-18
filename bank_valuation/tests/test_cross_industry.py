@@ -543,6 +543,37 @@ def test_cross_snapshots_are_as_of_each_chart_date_and_keep_daily_profit(monkeyp
     assert holding.profit_return == pytest.approx(0.1)
 
 
+def test_cross_holding_price_path_uses_actual_unadjusted_closes(monkeypatch):
+    days = [date(2025, 1, 1), date(2025, 1, 2), date(2025, 1, 3)]
+    item = _direct_cross_data("A", days, [2000.0, 2200.0, 2400.0])
+    item = replace(
+        item,
+        raw_market={
+            day: SecurityMarketPoint(close=price, pb=1.0, pe=10.0)
+            for day, price in zip(days, [20.0, 22.0, 24.0], strict=True)
+        },
+    )
+    monkeypatch.setattr(cross, "_rank_candidates", lambda *_args: [_candidate("A")])
+
+    result = cross._run_one_strategy(
+        "income_core",
+        {"name": "test", "description": "test"},
+        {"A": item},
+        days,
+        _query(["telecom"], days, rebalance_frequency="monthly"),
+    )
+
+    series = result.holding_price_series[0]
+    holding = result.current_holdings[0]
+    assert [point.value for point in series.price_curve] == [20.0, 22.0, 24.0]
+    assert series.entry_price == 20.0
+    assert series.current_price == 24.0
+    assert series.high_price == 24.0
+    assert series.low_price == 20.0
+    assert series.price_return == pytest.approx(0.2)
+    assert series.estimated_shares == pytest.approx(holding.position_value / 24.0)
+
+
 def test_cross_rebalance_snapshot_uses_selection_available_on_that_day(monkeypatch):
     days = [date(2025, 1, 31), date(2025, 2, 1), date(2025, 2, 2)]
     data = {
