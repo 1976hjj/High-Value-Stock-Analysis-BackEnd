@@ -592,6 +592,7 @@ class StrategyBacktestResult(BaseModel):
     transaction_cost_curve: list[BacktestPoint] = Field(default_factory=list)
     yearly_returns: list[BacktestYearReturn]
     current_holdings: list[BacktestHolding]
+    current_recommendation: BacktestSelectionSnapshot | None = None
     holding_snapshots: list[BacktestHoldingSnapshot] = Field(default_factory=list)
     selection_snapshots: list[BacktestSelectionSnapshot] = Field(default_factory=list)
     holding_price_series: list[BacktestHoldingPriceSeries] = Field(default_factory=list)

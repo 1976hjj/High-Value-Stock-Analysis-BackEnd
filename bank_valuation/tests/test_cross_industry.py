@@ -602,6 +602,32 @@ def test_cross_rebalance_snapshot_uses_selection_available_on_that_day(monkeypat
     assert replacement.profit == 0.0
 
 
+def test_cross_current_recommendation_uses_end_date_factors(monkeypatch):
+    days = [date(2025, 1, 2), date(2025, 1, 3)]
+    data = {
+        "A": _direct_cross_data("A", days, [10.0, 10.0]),
+        "B": _direct_cross_data("B", days, [10.0, 10.0]),
+    }
+
+    def fake_rank(_strategy_id, _data, day, _query):
+        return [_candidate("A" if day == days[0] else "B")]
+
+    monkeypatch.setattr(cross, "_rank_candidates", fake_rank)
+    result = cross._run_one_strategy(
+        "income_core",
+        {"name": "test", "description": "test"},
+        data,
+        days,
+        _query(["telecom"], days, holding_count=3, rebalance_frequency="monthly"),
+    )
+
+    assert [item.stock_code for item in result.current_holdings] == ["A"]
+    assert result.current_recommendation is not None
+    assert result.current_recommendation.date == days[-1]
+    assert [item.stock_code for item in result.current_recommendation.holdings] == ["B"]
+    assert result.current_recommendation.cash_weight == pytest.approx(0.1)
+
+
 def test_cross_valuation_percentile_excludes_future_market_data():
     days = [date(2025, 1, 1), date(2025, 1, 2), date(2025, 1, 3)]
     item = _direct_cross_data("A", days, [10.0, 20.0, 1.0])
@@ -609,3 +635,21 @@ def test_cross_valuation_percentile_excludes_future_market_data():
     # Telecom uses PE. On 1/2, 20 is the maximum of the two known values;
     # the later value of 1 must not enter the denominator or ranking signal.
     assert cross._valuation_percentile(item, days[1]) == pytest.approx(1.0)
+
+
+def test_cross_valuation_factors_expose_median_reversion_upside():
+    days = [date(2025, 1, 1), date(2025, 1, 2), date(2025, 1, 3)]
+    item = _direct_cross_data("A", days, [10.0, 10.0, 10.0])
+    item = replace(
+        item,
+        market={
+            days[0]: SecurityMarketPoint(close=10.0, pb=1.0, pe=12.0),
+            days[1]: SecurityMarketPoint(close=10.0, pb=1.0, pe=10.0),
+            days[2]: SecurityMarketPoint(close=10.0, pb=1.0, pe=8.0),
+        },
+    )
+
+    percentile, reversion = cross._valuation_factors(item, days[-1])
+
+    assert percentile == pytest.approx(1 / 3)
+    assert reversion == pytest.approx(0.25)

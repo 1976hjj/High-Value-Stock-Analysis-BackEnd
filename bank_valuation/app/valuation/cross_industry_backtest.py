@@ -71,6 +71,7 @@ class CrossCandidate:
     stable_growth_score: float = 0.0
     quality_score: float = 0.0
     valuation_percentile: float = 0.5
+    reversion_potential: float | None = None
 
 
 CROSS_STRATEGIES = {
@@ -433,6 +434,27 @@ def _run_one_strategy(
         dates[-1],
         position_dividend_profits,
     )
+    recommendation_candidates = _rank_candidates(strategy_id, data, dates[-1], query)
+    recommendation_weights = _target_weights(
+        strategy_id,
+        recommendation_candidates,
+        query,
+    )
+    current_recommendation = BacktestSelectionSnapshot(
+        date=dates[-1],
+        holdings=_holdings_from_candidates(
+            recommendation_candidates,
+            recommendation_weights,
+            {},
+            {},
+            {},
+            0.0,
+            dates[-1],
+            {},
+        ),
+        candidate_count=len(recommendation_candidates),
+        cash_weight=round(max(0.0, 1 - sum(recommendation_weights.values())), 6),
+    )
     required_dates = {
         metrics.max_drawdown_date,
         *(holding.entry_date for holding in holdings if holding.entry_date is not None),
@@ -473,6 +495,7 @@ def _run_one_strategy(
         transaction_cost_curve=_sample_curve(transaction_cost_curve, required_dates=sampled_dates),
         yearly_returns=_yearly_returns(equity, initial_value=query.initial_capital),
         current_holdings=holdings,
+        current_recommendation=current_recommendation,
         holding_snapshots=sampled_snapshots,
         selection_snapshots=selection_snapshots,
         holding_price_series=holding_price_series,
@@ -510,7 +533,7 @@ def _rank_candidates(
         safety = profile.income_score * .58 + defense * .42
         growth = profile.quality_score * .68 + stability * .32
         risk = _clamp(100 - (defense * .68 + stability * .32), 0, 100)
-        valuation_percentile = _valuation_percentile(item, day)
+        valuation_percentile, reversion_potential = _valuation_factors(item, day)
         valuation = (1 - valuation_percentile) * 100
         dividend_yield = _trailing_dividend_yield(item, day)
         if dividend_yield is None and query.min_dividend_yield > 0:
@@ -560,12 +583,20 @@ def _rank_candidates(
                 stable_growth_score=growth,
                 quality_score=profile.quality_score,
                 valuation_percentile=valuation_percentile,
+                reversion_potential=reversion_potential,
             )
         )
     return sorted(candidates, key=lambda item: item.score, reverse=True)
 
 
 def _valuation_percentile(item: CrossBacktestData, day: date) -> float:
+    return _valuation_factors(item, day)[0]
+
+
+def _valuation_factors(
+    item: CrossBacktestData,
+    day: date,
+) -> tuple[float, float | None]:
     industry = INDUSTRY_CATALOG[item.profile.industry_id]
     start = day - timedelta(days=365 * 5)
     values: list[float] = []
@@ -579,8 +610,11 @@ def _valuation_percentile(item: CrossBacktestData, day: date) -> float:
             if item_day == day:
                 current = value
     if not values or current is None:
-        return .5
-    return sum(1 for value in values if value <= current) / len(values)
+        return .5, None
+    percentile = sum(1 for value in values if value <= current) / len(values)
+    median_value = statistics.median(values)
+    reversion_potential = max(0.0, median_value / current - 1)
+    return percentile, reversion_potential
 
 
 def _target_weights(
@@ -744,6 +778,11 @@ def _holdings_from_candidates(
             stable_growth_score=round(item.stable_growth_score, 2),
             quality_score=round(item.quality_score, 2),
             valuation_percentile=round(item.valuation_percentile, 6),
+            reversion_potential=(
+                round(item.reversion_potential, 6)
+                if item.reversion_potential is not None
+                else None
+            ),
         )
         for item in candidates
         if item.code in weights

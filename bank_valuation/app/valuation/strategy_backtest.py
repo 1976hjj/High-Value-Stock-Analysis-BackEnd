@@ -512,6 +512,21 @@ def _run_one_strategy(
         portfolio_value,
         position_dividend_profits,
     )
+    recommendation_candidates = _rank_candidates(strategy_id, data, dates[-1], query)
+    recommendation_weights = _target_weights(
+        strategy_id,
+        recommendation_candidates,
+        query.holding_count,
+    )
+    current_recommendation = BacktestSelectionSnapshot(
+        date=dates[-1],
+        holdings=_holdings_from_candidates(
+            recommendation_candidates,
+            recommendation_weights,
+        ),
+        candidate_count=len(recommendation_candidates),
+        cash_weight=round(max(0.0, 1 - sum(recommendation_weights.values())), 6),
+    )
     required_dates = {
         metrics.max_drawdown_date,
         *(holding.entry_date for holding in holdings if holding.entry_date is not None),
@@ -543,6 +558,7 @@ def _run_one_strategy(
         transaction_cost_curve=_sample_curve(transaction_cost_curve, required_dates=sampled_dates),
         yearly_returns=yearly,
         current_holdings=holdings,
+        current_recommendation=current_recommendation,
         holding_snapshots=[snapshot for snapshot in holding_snapshots if snapshot.date in sampled_dates],
         selection_snapshots=selection_snapshots,
         holding_price_series=holding_price_series,
@@ -565,6 +581,7 @@ def _holdings_from_candidates(
         BacktestHolding(
             stock_code=item.code,
             stock_name=item.name,
+            industry_id="bank",
             weight=round(weights.get(item.code, 0.0), 6),
             score=round(item.score, 2),
             dividend_yield=round(item.dividend_yield, 6) if item.dividend_yield is not None else None,

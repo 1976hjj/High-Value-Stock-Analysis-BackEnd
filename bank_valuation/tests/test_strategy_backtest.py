@@ -189,6 +189,43 @@ def test_selection_snapshots_freeze_the_historical_ranking_factors(monkeypatch):
     assert first.holdings[0].dividend_safety_score == 76.0
     assert first.holdings[0].stable_growth_score == 72.0
     assert first.holdings[0].valuation_percentile == pytest.approx(0.23)
+    assert first.holdings[0].industry_id == "bank"
+
+
+def test_current_recommendation_reranks_on_the_backtest_end_date(monkeypatch):
+    days = [date(2025, 1, 2), date(2025, 1, 3)]
+    data = {
+        code: _data(code, {day: 10.0 for day in days})
+        for code in ("A", "B", "C", "D")
+    }
+
+    def fake_rank(_strategy_id, _data, day, _query):
+        codes = ["A", "B", "C"] if day == days[0] else ["D", "C", "B"]
+        return [
+            backtest.Candidate(
+                code=code,
+                name=code,
+                score=90.0 - index,
+                dividend_yield=0.05,
+                risk_score=10.0 + index,
+            )
+            for index, code in enumerate(codes)
+        ]
+
+    monkeypatch.setattr(backtest, "_rank_candidates", fake_rank)
+    result = backtest._run_one_strategy(
+        "income_core",
+        {"name": "test", "description": "test"},
+        data,
+        days,
+        _query(rebalance_frequency="monthly"),
+    )
+
+    assert [item.stock_code for item in result.current_holdings] == ["A", "B", "C"]
+    assert result.current_recommendation is not None
+    assert result.current_recommendation.date == days[-1]
+    assert [item.stock_code for item in result.current_recommendation.holdings] == ["D", "C", "B"]
+    assert len(result.current_recommendation.holdings) == 3
 
 
 def test_sampled_crosshair_keeps_the_exact_max_drawdown_date_and_snapshot(monkeypatch):
