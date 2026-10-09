@@ -4,6 +4,10 @@ from pathlib import Path
 from fastapi import FastAPI
 from .routers.bank import router as bank_router
 from .routers.strategy import router as strategy_router
+from .routers.data_sync import router as data_sync_router
+from .data_sources.access_policy import local_data_only
+from contextlib import asynccontextmanager
+from .data_sync import pause_sync
 
 
 def configure_logging() -> None:
@@ -27,13 +31,27 @@ def configure_logging() -> None:
 
 configure_logging()
 
+@asynccontextmanager
+async def lifespan(app):
+    yield
+    pause_sync()
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title="A股多行业价值与危机防御后端",
     version="0.2.0",
     description="银行深度估值、行业分析与跨行业防御策略服务；不构成投资建议。",
 )
 app.include_router(bank_router)
 app.include_router(strategy_router)
+app.include_router(data_sync_router)
+
+
+@app.middleware('http')
+async def use_synchronized_local_data(request, call_next):
+    with local_data_only():
+        return await call_next(request)
 
 
 @app.get("/health")

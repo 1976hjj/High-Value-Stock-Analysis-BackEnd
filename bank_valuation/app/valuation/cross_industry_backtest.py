@@ -38,6 +38,7 @@ from .strategy_backtest import (
     _fetch_dividend_events,
     _metrics,
     _holding_price_series,
+    _latest_implemented_fiscal_year_dividend,
     _profit_contribution_periods,
     _read_dividend_events,
     _record_stock_profit,
@@ -189,9 +190,10 @@ def run_cross_industry_backtest(
         ),
         data_note=(
             "跨行业 v1 使用 Baostock 后复权日线、当日以前的 PB/PE 分位、滚动波动与回撤；"
-            "股息率以估值日前最新已实施财年内的现金分红除以当日不复权收盘价；"
-            "同一财年内的中期和年度分红合并，避免滚动365日窗口跨财年重复计入，"
-            "重复分红事件按除息日和每股派息去重，缺失时标记暂无数据且不使用目录预设值。"
+            "股息筛选及评分统一使用回测当日已公告、已实施的最近完整财年分红 / 当日不复权收盘价；"
+            "合并同一财年的中期与末期分红，最新中期不替代完整年度，送转股后按当日股数折算。"
+            "零分红年度保留，重复事件去重，缺失完整财年时标记暂无数据且不使用目录预设值。"
+            "组合收益采用后复权价格，已包含实际分红，不重复按年度股息率加收益。"
             "业务防御/质量分仍是公开展示的研究先验，不作为历史财务事实。"
             "股票池存在上市存续与幸存者偏差，结果适合验证组合框架，不代表未来收益。"
         ),
@@ -535,7 +537,7 @@ def _rank_candidates(
         risk = _clamp(100 - (defense * .68 + stability * .32), 0, 100)
         valuation_percentile, reversion_potential = _valuation_factors(item, day)
         valuation = (1 - valuation_percentile) * 100
-        dividend_yield = _trailing_dividend_yield(item, day)
+        dividend_yield = _annual_dividend_yield(item, day)
         if dividend_yield is None and query.min_dividend_yield > 0:
             continue
         dividend_for_score = dividend_yield or 0.0
@@ -846,7 +848,7 @@ def _load_dividend_histories(
             if not events:
                 failures.append({
                     "stock_code": profile.code,
-                    "error": "未取得可核验的已实施现金分红记录，股息率按暂无数据处理",
+                    "error": "未取得可核验的分红记录，股息率按暂无数据处理",
                 })
                 continue
             if refresh_cache:
@@ -858,15 +860,15 @@ def _load_dividend_histories(
 
 
 def _deduplicate_dividend_events(events: list[DividendEvent]) -> list[DividendEvent]:
-    unique: dict[tuple[date, float], DividendEvent] = {}
-    for event in events:
-        if event.ex_dividend_date is None or event.cash_per_share <= 0:
-            continue
-        key = (event.ex_dividend_date, round(event.cash_per_share, 8))
-        existing = unique.get(key)
-        if existing is None or event.announcement_date < existing.announcement_date:
-            unique[key] = event
-    return sorted(unique.values(), key=lambda event: (event.ex_dividend_date or event.report_date, event.report_date))
+    # Preserve zero-dividend years and pure stock distributions. Removing them
+    # would revive old cash dividends or lose the current-share adjustment.
+    from ..data_sources.bank_statistics import dividend_records
+    rows = dividend_records([{'report_date': event.report_date,
+        'announcement_date': event.announcement_date, 'ex_dividend_date': event.ex_dividend_date,
+        'cash_per_share': event.cash_per_share, 'bonus_per_ten': event.bonus_per_ten} for event in events])
+    return sorted((DividendEvent(row['report_date'], row['announcement_date'], row['ex_dividend_date'],
+        row['cash_per_share'], row['bonus_per_ten']) for row in rows),
+        key=lambda event: (event.ex_dividend_date or event.report_date, event.report_date))
 
 
 def _market_price_at_or_before(
@@ -879,23 +881,15 @@ def _market_price_at_or_before(
     return market[max(available)].close
 
 
-def _trailing_dividend_yield(item: CrossBacktestData, day: date) -> float | None:
+def _annual_dividend_yield(item: CrossBacktestData, day: date) -> float | None:
+    """Use the same dated, completed-fiscal-year basis as the bank backtest."""
     if not item.dividend_data_available:
         return None
     price = _market_price_at_or_before(item.raw_market, day)
     if price is None or price <= 0:
         return None
-    yearly_cash: dict[int, float] = {}
-    for event in _deduplicate_dividend_events(item.dividends):
-        if (
-            event.ex_dividend_date is not None
-            and event.ex_dividend_date <= day
-            and event.announcement_date <= day
-        ):
-            yearly_cash[event.report_date.year] = yearly_cash.get(event.report_date.year, 0.0) + event.cash_per_share
-    if not yearly_cash:
-        return None
-    return yearly_cash[max(yearly_cash)] / price
+    annual_cash = _latest_implemented_fiscal_year_dividend(item.dividends, day)
+    return annual_cash / price if annual_cash is not None else None
 
 
 def _cash_dividend_on_day(events: list[DividendEvent], day: date) -> float:

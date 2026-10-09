@@ -2,6 +2,12 @@ import pytest
 from bank_valuation.app.models import BankInput
 
 
+@pytest.fixture(autouse=True)
+def isolate_disclosure_cache(monkeypatch, tmp_path):
+    from bank_valuation.app.data_sources import bank_statistics
+    monkeypatch.setattr(bank_statistics, 'DISCLOSURE_CACHE', tmp_path / 'disclosures')
+
+
 @pytest.fixture
 def bank() -> BankInput:
     return BankInput(

@@ -13,6 +13,7 @@ import baostock as bs
 
 from .bank_base import _BAOSTOCK_LOCK
 from .industry_catalog import IndustryStockProfile
+from .access_policy import network_allowed, require_network
 
 
 logger = logging.getLogger("bank_valuation.financial_snapshot")
@@ -50,7 +51,7 @@ def _read_cache(code: str, valuation_date: date) -> FinancialSnapshot | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         fetched_at = datetime.fromisoformat(payload["fetched_at"])
-        if datetime.now() - fetched_at > timedelta(hours=24):
+        if network_allowed() and datetime.now() - fetched_at > timedelta(hours=24):
             return None
         snapshot = payload["snapshot"]
         return FinancialSnapshot(
@@ -241,6 +242,18 @@ def load_financial_snapshot(
         cached = _read_cache(stock.code, valuation_date)
         if cached is not None:
             return cached
+        if not network_allowed():
+            paths = sorted(_CACHE_DIR.glob(f"{stock.code.replace('.', '_')}_*.json"), reverse=True)
+            for path in paths:
+                try:
+                    cached_date = date.fromisoformat(path.stem[-10:])
+                except ValueError:
+                    continue
+                if cached_date <= valuation_date:
+                    cached = _read_cache(stock.code, cached_date)
+                    if cached and cached.published_date <= valuation_date:
+                        return cached
+    require_network()
     with _BAOSTOCK_LOCK:
         login = bs.login()
         if login.error_code != "0":

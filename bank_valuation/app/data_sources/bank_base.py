@@ -2,6 +2,7 @@
 from __future__ import annotations
 from datetime import date, timedelta
 import csv
+import json
 import logging
 import math
 from pathlib import Path
@@ -10,15 +11,15 @@ import time
 import baostock as bs
 from ..models import BankInput
 from .akshare_bank_metrics import fetch_bank_special_metrics
+from .access_policy import network_allowed, require_network
+from .bank_statistics import correct_bank_statistics, dividend_records, dividend_summary, write_disclosures
 
 
-# Baostock does not reliably publish these bank-specific indicators.  They are
-# explicit conservative defaults, rather than invented "real-time" values.
+# These are model assumptions, separate from disclosed financial indicators.
 DEFAULT_BANK_ASSUMPTIONS = {
     "risk_free_rate": 0.02, "equity_risk_premium": 0.06, "beta": 0.8,
     "long_term_growth": 0.03,
 }
-DEFAULT_PAYOUT_RATIO = 0.4
 DIVIDEND_LOOKBACK_DAYS = 365
 logger = logging.getLogger("bank_valuation.data")
 _BAOSTOCK_LOCK = threading.RLock()
@@ -132,12 +133,18 @@ def _write_disk_cache(
         "requested_date", "stock_code", "stock_name", "market_date", "financial_report_date", "current_price", "daily_change_pct", "bps", "eps", "roe", "net_profit", "profit_growth_yoy", "dividend_per_share", "payout_ratio", "dividend_yield", "pb_current", "pe_current", "nim", "npl_ratio", "provision_coverage", "provision_coverage_report_date", "provision_coverage_source", "cet1_ratio", "capital_adequacy_ratio", "net_interest_spread", "loan_provision_ratio", "loan_to_deposit_ratio", "bank_special_metrics_report_date", "bank_special_metrics_source", "risk_free_rate", "equity_risk_premium", "beta", "long_term_growth", "roe_trend", "nim_change", "npl_ratio_change", "provision_coverage_change", "dividend_stable",
         "history_full", "history_years", "history_start_date",
     ]
+    snapshot_fields += ['statistics_version', 'dividend_fiscal_year', 'dividend_basis',
+                        'dividend_cash_ttm', 'dividend_yield_ttm', 'dividend_annual_eps',
+                        'payout_basis', 'eps_basis', 'roe_reported', 'roe_basis',
+                        'financial_published_date', 'financial_metrics_source', 'trend_comparison_date',
+                        'data_quality_notes']
     existing: list[dict[str, str]] = []
     if snapshot.exists():
         with snapshot.open("r", encoding="utf-8", newline="") as file:
             existing = list(csv.DictReader(file))
     row = {field: str(getattr(bank, field)) for field in snapshot_fields if field not in {"requested_date", "history_full", "history_years", "history_start_date"}}
     row["requested_date"] = requested_date.isoformat()
+    row['data_quality_notes'] = json.dumps(bank.data_quality_notes, ensure_ascii=False)
     row["history_full"] = str(include_full_history or history_years is None)
     row["history_years"] = "" if history_years is None else str(history_years)
     row["history_start_date"] = str(bank.pb_history_dates[0]) if bank.pb_history_dates else ""
@@ -145,7 +152,8 @@ def _write_disk_cache(
     existing = [item for item in existing if item.get("requested_date") != row["requested_date"]]
     existing.append(row)
     existing.sort(key=lambda item: item["requested_date"])
-    with snapshot.open("w", encoding="utf-8", newline="") as file:
+    snapshot_tmp = snapshot.with_suffix('.tmp')
+    with snapshot_tmp.open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=snapshot_fields)
         writer.writeheader(); writer.writerows(existing)
 
@@ -163,9 +171,14 @@ def _write_disk_cache(
                 "pb": str(bank.pb_history[index]),
                 "pe": "" if pe is None else str(pe),
             }
-    with market.open("w", encoding="utf-8", newline="") as file:
+    market_tmp = market.with_suffix('.tmp')
+    with market_tmp.open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=["date", "close", "pb", "pe"])
         writer.writeheader(); writer.writerows(sorted(market_rows.values(), key=lambda item: item["date"]))
+    market_tmp.replace(market)
+    # Commit the snapshot last: cancellation must not expose a new snapshot
+    # against an old market history. Older snapshots remain valid with new history.
+    snapshot_tmp.replace(snapshot)
     logger.info("Bank CSV cache written: snapshot=%s market=%s", snapshot, market)
 
 
@@ -216,13 +229,34 @@ def _read_disk_cache(
         # Legacy CSV files contained synthetic bank-specific defaults. Only use
         # these fields when a real source marker is present.
         source = row.get("bank_special_metrics_source") if not _is_blank(row.get("bank_special_metrics_source")) else None
+        restored = restored.model_copy(update={field: None if _is_blank(row.get(field)) else value(field)
+            for field in ('roe_trend', 'nim_change', 'npl_ratio_change', 'provision_coverage_change')})
+        if _is_blank(row.get('dividend_stable')):
+            restored = restored.model_copy(update={'dividend_stable': None})
+        restored = restored.model_copy(update={field: None for field in
+            ('roe_trend', 'nim_change', 'npl_ratio_change', 'provision_coverage_change', 'dividend_stable')
+            if not row.get('statistics_version') or row.get('statistics_version') == '0'})
+        # Versioned snapshots remain self-describing even if the raw disclosure
+        # cache is temporarily unavailable. Recalculation can still enrich them.
+        metadata = {}
+        for field in ('dividend_cash_ttm', 'dividend_yield_ttm', 'dividend_annual_eps', 'roe_reported'):
+            metadata[field] = _optional_float(row, field)
+        for field in ('statistics_version', 'dividend_fiscal_year'):
+            if not _is_blank(row.get(field)):
+                metadata[field] = int(row[field])
+        for field in ('dividend_basis', 'payout_basis', 'eps_basis', 'roe_basis', 'financial_metrics_source'):
+            metadata[field] = None if _is_blank(row.get(field)) else row[field]
+        for field in ('financial_published_date', 'trend_comparison_date'):
+            metadata[field] = None if _is_blank(row.get(field)) else date.fromisoformat(row[field])
+        metadata['data_quality_notes'] = json.loads(row['data_quality_notes']) if not _is_blank(row.get('data_quality_notes')) else []
+        restored = restored.model_copy(update=metadata)
         if not source:
-            return restored.model_copy(update={"nim": None, "npl_ratio": None, "provision_coverage": None, "cet1_ratio": None, "capital_adequacy_ratio": None, "net_interest_spread": None, "loan_provision_ratio": None, "loan_to_deposit_ratio": None})
+            return correct_bank_statistics(restored.model_copy(update={"nim": None, "npl_ratio": None, "provision_coverage": None, "cet1_ratio": None, "capital_adequacy_ratio": None, "net_interest_spread": None, "loan_provision_ratio": None, "loan_to_deposit_ratio": None}))
         report_date_text = row.get("bank_special_metrics_report_date")
-        return restored.model_copy(update={
+        return correct_bank_statistics(restored.model_copy(update={
             "bank_special_metrics_source": source,
             "bank_special_metrics_report_date": date.fromisoformat(report_date_text) if not _is_blank(report_date_text) else None,
-        })
+        }))
     except (OSError, ValueError, KeyError):
         logger.warning("Bank CSV cache unreadable; will refresh: code=%s requested_date=%s", code, requested_date, exc_info=True)
         return None
@@ -230,6 +264,8 @@ def _read_disk_cache(
 
 def _enrich_bank_special_metrics(bank: BankInput) -> BankInput:
     """Fill bank-only indicators from AKShare without overwriting supplied data."""
+    if not network_allowed():
+        return bank
     if bank.bank_special_metrics_source and all(value is not None for value in (bank.nim, bank.npl_ratio, bank.provision_coverage, bank.cet1_ratio, bank.capital_adequacy_ratio, bank.net_interest_spread, bank.loan_provision_ratio, bank.loan_to_deposit_ratio)):
         return bank
     metrics = fetch_bank_special_metrics(bank.stock_code, bank.market_date or date.today())
@@ -361,20 +397,14 @@ def _latest_fiscal_year_dividend(code: str, as_of: date) -> float | None:
     if frame is None or frame.empty or len(frame.columns) < 6:
         return None
 
-    report_col, announcement_col, cash_col = frame.columns[0], frame.columns[1], frame.columns[5]
-    yearly_cash: dict[int, float] = {}
-    for _, row in frame.iterrows():
-        report_date = _coerce_date(row.get(report_col))
-        announcement_date = _coerce_date(row.get(announcement_col))
-        cash_per_10 = _coerce_positive_float(row.get(cash_col))
-        if report_date is None or announcement_date is None or announcement_date > as_of or cash_per_10 <= 0:
-            continue
-        yearly_cash[report_date.year] = yearly_cash.get(report_date.year, 0.0) + cash_per_10 / 10
-    if not yearly_cash:
+    source_rows = frame.to_dict(orient='records')
+    if '报告期' not in frame.columns and 'report_date' in frame.columns:
+        source_rows = [dict(row, cash_per_share=float(row['cash_per_10']) / 10) for row in source_rows]
+    write_disclosures(code, dividends=source_rows)
+    summary = dividend_summary(dividend_records(source_rows), as_of)
+    latest_year, dividend = summary['year'], summary['annual']
+    if dividend is None:
         return None
-
-    latest_year = max(yearly_cash)
-    dividend = yearly_cash[latest_year]
     logger.info(
         "Latest fiscal-year cash dividend: code=%s as_of=%s report_year=%s dividend_per_share=%.6f source=AKShare/Eastmoney",
         code,
@@ -485,7 +515,7 @@ def _load_bank_input_once(
         report_month = date.fromisoformat(profit["statDate"]).month
         roe *= 12 / report_month
         dividend = _trailing_dividend(code, actual_date)
-        payout = min(1.0, dividend / eps) if eps > 0 and dividend > 0 else DEFAULT_PAYOUT_RATIO
+        payout = dividend / eps if eps > 0 else 0.0
         name_rows = _rows(bs.query_stock_basic(code=code), "stock basic")
         name = BANK_NAMES.get(code) or (name_rows[0].get("code_name") if name_rows else code)
         result = BankInput(
@@ -532,6 +562,21 @@ def load_bank_input(
     """
     code = normalize_code(stock_code)
     requested_date = valuation_date or date.today()
+    if not network_allowed():
+        if refresh_cache:
+            require_network()
+        snapshot = _snapshot_path(code)
+        if snapshot.exists():
+            with snapshot.open(encoding='utf-8', newline='') as file:
+                dates = sorted({date.fromisoformat(row['requested_date']) for row in csv.DictReader(file)
+                                if row.get('requested_date') and row.get('market_date')
+                                and row['market_date'] <= requested_date.isoformat()}, reverse=True)
+            for cached_date in dates:
+                bank = _read_disk_cache(code, cached_date, allow_stale_current=True,
+                                        history_years=history_years, include_full_history=False)
+                if bank is not None and bank.market_date and bank.market_date <= requested_date:
+                    return bank
+        require_network()
     cache_key = (code, requested_date.isoformat(), include_full_history, history_years, include_pe_history)
     now = time.monotonic()
     with _BAOSTOCK_LOCK:
@@ -565,13 +610,13 @@ def load_bank_input(
         for attempt in range(1, 4):
             try:
                 logger.info("Data load attempt %d/3: code=%s requested_date=%s", attempt, code, requested_date)
-                result = _enrich_bank_special_metrics(_load_bank_input_once(
+                result = correct_bank_statistics(_enrich_bank_special_metrics(_load_bank_input_once(
                     code,
                     requested_date,
                     history_years=history_years,
                     include_full_history=include_full_history,
                     include_pe_history=include_pe_history,
-                ))
+                )))
                 _data_cache[cache_key] = (time.monotonic(), result)
                 _write_disk_cache(
                     requested_date,

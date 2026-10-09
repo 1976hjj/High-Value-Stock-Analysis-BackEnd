@@ -14,6 +14,7 @@ import baostock as bs
 
 from .bank_base import _BAOSTOCK_LOCK
 from .industry_catalog import IndustryStockProfile
+from .access_policy import network_allowed
 
 
 logger = logging.getLogger("bank_valuation.strategy_history")
@@ -191,6 +192,13 @@ def load_market_histories(
     missing: list[tuple[IndustryStockProfile, date, date]] = []
     for stock in stocks:
         cached = _read_cache(stock.code, adjustment)
+        if not network_allowed():
+            usable = {day: point for day, point in cached.items() if start_date <= day <= end_date}
+            if usable and not refresh_cache:
+                histories[stock.code] = usable
+            else:
+                failures.append({'stock_code': stock.code, 'error': '本地行情缺失，请到「数据同步」同步行情和复权日线。'})
+            continue
         if not refresh_cache and _cache_covers(stock.code, adjustment, cached, start_date, end_date):
             histories[stock.code] = {
                 day: point for day, point in cached.items() if start_date <= day <= end_date

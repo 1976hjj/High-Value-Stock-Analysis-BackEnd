@@ -153,7 +153,8 @@ def test_latest_fiscal_year_dividend_ignores_future_announcements(monkeypatch):
         SimpleNamespace(stock_fhps_detail_em=lambda symbol: frame),
     )
 
-    assert bank_base._latest_fiscal_year_dividend("sh.601577", date(2026, 7, 7)) == 0.2
+    # An interim-only year is not a complete annual dividend.
+    assert bank_base._latest_fiscal_year_dividend("sh.601577", date(2026, 7, 7)) is None
 
 
 def test_mean_reversion_overview_ranks_healthy_cheap_bank_above_risky_discount(monkeypatch, bank):

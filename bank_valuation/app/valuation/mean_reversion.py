@@ -62,6 +62,10 @@ def bank_mean_reversion_overview(
             "会标记为“风险型低估”并降低排序。股息安全分强调分红覆盖、资本缓冲、资产质量和盈利稳定；"
             "高股息低风险候选池优先选择股息率有吸引力但不过度依赖高分红率的银行。默认优先读取不晚于估值日期的本地快照以保证看板快速返回；"
             "需要逐家联网刷新时传入 refresh_cache=true。"
+            "股息主列使用最近完整财年的税前分红（中期+末期），另列近365日实付股息；"
+            "送转股按当前股数折算。派息率匹配同一财年的普通股盈利，"
+            "ROE优先使用披露的加权普通股ROE，否则按报告期加权ROE年化估算；"
+            "缺失趋势不视为持平，完整年度分红缺失须复核。"
         ),
     )
 
@@ -93,7 +97,8 @@ def _load_latest_cached_bank(code: str, requested_date: date) -> BankInput:
             available_dates = [
                 date.fromisoformat(row["requested_date"])
                 for row in csv.DictReader(file)
-                if row.get("requested_date") and date.fromisoformat(row["requested_date"]) <= requested_date
+                if row.get("requested_date") and row.get('market_date')
+                and date.fromisoformat(row['market_date']) <= requested_date
             ]
     except (OSError, KeyError, ValueError) as exc:
         raise RuntimeError("本地缓存不可读") from exc
@@ -148,6 +153,10 @@ def _build_row(bank: BankInput, valuation) -> BankMeanReversionRow:
         upside_potential=valuation.upside_potential,
         margin_of_safety=valuation.margin_of_safety,
         dividend_yield=round(bank.dividend_yield, 6),
+        dividend_fiscal_year=bank.dividend_fiscal_year, dividend_per_share=bank.dividend_per_share,
+        dividend_yield_ttm=bank.dividend_yield_ttm, dividend_cash_ttm=bank.dividend_cash_ttm,
+        payout_ratio=bank.payout_ratio, financial_report_date=bank.financial_report_date,
+        roe_basis=bank.roe_basis, data_quality_notes=bank.data_quality_notes,
         roe=round(bank.roe, 6),
         profit_growth_yoy=round(bank.profit_growth_yoy, 6),
         npl_ratio=round(bank.npl_ratio, 6) if bank.npl_ratio is not None else None,
@@ -232,11 +241,11 @@ def _quality_score(bank: BankInput) -> float:
     elif bank.dividend_stable:
         score += 5
 
-    if bank.npl_ratio_change <= 0:
+    if (bank.npl_ratio_change is not None and bank.npl_ratio_change <= 0):
         score += 3
-    if bank.provision_coverage_change >= 0:
+    if (bank.provision_coverage_change is not None and bank.provision_coverage_change >= 0):
         score += 3
-    if bank.nim_change >= -.001:
+    if (bank.nim_change is not None and bank.nim_change >= -.001):
         score += 2
     return _clamp(score, 0, 100)
 
@@ -249,11 +258,11 @@ def _risk_score(bank: BankInput, final_rating: str, flags: list[str]) -> float:
         score += 20
     if bank.npl_ratio is not None and bank.npl_ratio > .02:
         score += 20
-    if bank.npl_ratio_change > .002:
+    if (bank.npl_ratio_change is not None and bank.npl_ratio_change > .002):
         score += 10
     if bank.provision_coverage is not None and bank.provision_coverage < 1.5:
         score += 15
-    if bank.provision_coverage_change < 0:
+    if (bank.provision_coverage_change is not None and bank.provision_coverage_change < 0):
         score += 8
     if bank.cet1_ratio is not None and bank.cet1_ratio < .085:
         score += 25
@@ -410,11 +419,11 @@ def _stable_growth_score(bank: BankInput, risk: float) -> float:
     elif bank.cet1_ratio >= .085:
         score += 4
 
-    if bank.npl_ratio_change <= 0:
+    if (bank.npl_ratio_change is not None and bank.npl_ratio_change <= 0):
         score += 4
-    if bank.provision_coverage_change >= 0:
+    if (bank.provision_coverage_change is not None and bank.provision_coverage_change >= 0):
         score += 3
-    if bank.nim_change >= -.001:
+    if (bank.nim_change is not None and bank.nim_change >= -.001):
         score += 3
     return _clamp(score - risk * .25, 0, 100)
 
@@ -486,7 +495,7 @@ def _tags(bank: BankInput, pb_percentile: float, upside: float, status: str) -> 
         tags.append("股息托底")
     if bank.cet1_ratio is not None and bank.cet1_ratio >= .095:
         tags.append("资本缓冲充足")
-    if bank.npl_ratio is not None and bank.npl_ratio <= .016 and bank.npl_ratio_change <= 0:
+    if bank.npl_ratio is not None and bank.npl_ratio <= .016 and (bank.npl_ratio_change is not None and bank.npl_ratio_change <= 0):
         tags.append("资产质量稳定")
     if status == "risk_discount":
         tags.append("风险型低估")

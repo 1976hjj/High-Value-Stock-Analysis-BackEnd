@@ -26,11 +26,11 @@ def scenario_probabilities(bank: BankInput, pb_percentile: float) -> dict[str, f
         weights["bear"] += 0.14; weights["crisis"] += 0.12; weights["bull"] -= 0.10; weights["base"] -= 0.16
     if bank.profit_growth_yoy < -0.05:
         weights["bear"] += 0.08; weights["crisis"] += 0.05; weights["base"] -= 0.08; weights["bull"] -= 0.05
-    if bank.npl_ratio_change > 0 and bank.provision_coverage_change < 0:
+    if (bank.npl_ratio_change is not None and bank.npl_ratio_change > 0) and (bank.provision_coverage_change is not None and bank.provision_coverage_change < 0):
         weights["crisis"] += 0.12; weights["bear"] += 0.05; weights["base"] -= 0.10; weights["bull"] -= 0.07
     if bank.cet1_ratio is not None and bank.cet1_ratio < 0.085:
         weights["crisis"] += 0.10; weights["base"] -= 0.07; weights["bull"] -= 0.03
-    if bank.nim_change < -0.002:
+    if (bank.nim_change is not None and bank.nim_change < -0.002):
         weights["bear"] += 0.05; weights["base"] -= 0.03; weights["bull"] -= 0.02
     weights = {key: max(0.01, value) for key, value in weights.items()}
     total = sum(weights.values())
@@ -57,7 +57,7 @@ def _current_fit(name: str, bank: BankInput) -> dict[str, list[str] | str]:
         gaps = []
         (supporting if bank.roe >= .10 else gaps).append("ROE已达到10%以上" if bank.roe >= .10 else "ROE需进一步升至11%以上")
         (supporting if bank.profit_growth_yoy >= .03 else gaps).append("利润增速已在3%以上" if bank.profit_growth_yoy >= .03 else "利润增速需升至3%以上")
-        (supporting if bank.npl_ratio_change <= 0 else gaps).append("资产质量未见恶化" if bank.npl_ratio_change <= 0 else "需扭转不良率上行")
+        (supporting if (bank.npl_ratio_change is not None and bank.npl_ratio_change <= 0) else gaps).append("资产质量未见恶化" if (bank.npl_ratio_change is not None and bank.npl_ratio_change <= 0) else "需扭转不良率上行")
     elif name == "base":
         supporting = ["盈利和资产质量未出现剧烈变化"]
         gaps = ["需继续观察息差与信贷需求是否稳定"]
@@ -65,13 +65,13 @@ def _current_fit(name: str, bank: BankInput) -> dict[str, list[str] | str]:
         supporting = []
         gaps = []
         (supporting if bank.profit_growth_yoy < 0 else gaps).append("利润已转为负增长" if bank.profit_growth_yoy < 0 else "若利润转负，悲观情景概率将上升")
-        (supporting if bank.nim_change < -.001 else gaps).append("净息差已有明显收窄" if bank.nim_change < -.001 else "若净息差收窄超过10bp，需提高关注")
-        (supporting if bank.npl_ratio_change > 0 else gaps).append("不良率正在上行" if bank.npl_ratio_change > 0 else "若不良率上行，将提高该情景概率")
+        (supporting if (bank.nim_change is not None and bank.nim_change < -.001) else gaps).append("净息差已有明显收窄" if (bank.nim_change is not None and bank.nim_change < -.001) else "若净息差收窄超过10bp，需提高关注")
+        (supporting if (bank.npl_ratio_change is not None and bank.npl_ratio_change > 0) else gaps).append("不良率正在上行" if (bank.npl_ratio_change is not None and bank.npl_ratio_change > 0) else "若不良率上行，将提高该情景概率")
     else:
         supporting = []
         gaps = []
         cet1_tight = bank.cet1_ratio is not None and bank.cet1_ratio < .085
         (supporting if cet1_tight else gaps).append("资本缓冲偏紧" if cet1_tight else "当前CET1未见低于8.5%缓冲线")
         (supporting if bank.roe < .04 else gaps).append("ROE已跌至危机区间" if bank.roe < .04 else "需警惕ROE快速降至4%以下")
-        (supporting if bank.npl_ratio_change > 0 and bank.provision_coverage_change < 0 else gaps).append("资产质量与拨备同时恶化" if bank.npl_ratio_change > 0 and bank.provision_coverage_change < 0 else "需警惕不良上升叠加拨备下降")
+        (supporting if (bank.npl_ratio_change is not None and bank.npl_ratio_change > 0) and (bank.provision_coverage_change is not None and bank.provision_coverage_change < 0) else gaps).append("资产质量与拨备同时恶化" if (bank.npl_ratio_change is not None and bank.npl_ratio_change > 0) and (bank.provision_coverage_change is not None and bank.provision_coverage_change < 0) else "需警惕不良上升叠加拨备下降")
     return {"assessment": "当前已有部分信号" if supporting else "当前尚未满足核心条件", "supporting_signals": supporting, "gaps_or_watchpoints": gaps}

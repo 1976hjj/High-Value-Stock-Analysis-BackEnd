@@ -115,6 +115,35 @@ def _assert_holding_ledger_balances(result) -> None:
         assert series.low_price <= series.entry_price <= series.high_price
 
 
+@pytest.mark.parametrize('cash', [0.0, .5])
+def test_bank_stock_distribution_preserves_capital_and_does_not_double_cash(monkeypatch, cash):
+    days = [date(2026, 6, 1), date(2026, 6, 2)]
+    dividend = bank.DividendEvent(date(2025, 12, 31), date(2026, 3, 1), days[1], cash, 1)
+    data = {code: _bank_data(code, days, [10, (10 - cash) / 1.1], [dividend, dividend])
+            for code in ['A', 'B', 'C']}
+    monkeypatch.setattr(bank, '_rank_candidates', lambda *_args: [
+        bank.Candidate(code=code, name=code, score=90, dividend_yield=.05, risk_score=10) for code in data])
+    result = bank._run_one_strategy('income_core', {'name':'bonus', 'description':'bonus'}, data, days, _bank_query())
+    # Three 10-share positions become 11-share positions. A cash distribution
+    # offsets the cash-related ex-price drop exactly; duplicated rows count once.
+    assert result.equity_curve[-1].value == pytest.approx(1000)
+    assert result.metrics.total_return == pytest.approx(0)
+    assert sum(item.dividend_profit for item in result.current_holdings) == pytest.approx(100 * cash, abs=.02)
+    assert sum(item.profit for item in result.current_holdings) == pytest.approx(0, abs=.02)
+    benchmark = bank._bank_equal_weight_benchmark(data, days, 1000)
+    assert benchmark[-1].value == pytest.approx(1000 * (1 - cash / 10))
+    _assert_holding_ledger_balances(result)
+
+
+def test_bank_stock_distribution_waits_for_ex_date_and_announcement():
+    days = [date(2026, 6, 1), date(2026, 6, 2)]
+    item = _bank_data('A', days, [10, 10], [
+        bank.DividendEvent(date(2025, 12, 31), days[0], days[1], 0, 1),
+        bank.DividendEvent(date(2025, 12, 31), date(2026, 6, 3), days[1], 0, 2)])
+    assert bank._share_distribution_factor_on_day(item, days[0]) == 1
+    assert bank._share_distribution_factor_on_day(item, days[1]) == pytest.approx(1.1)
+
+
 def test_bank_golden_ledger_balances_price_dividend_weights_and_profit(monkeypatch):
     days = [date(2025, 1, 1), date(2025, 1, 2)]
     dividend = bank.DividendEvent(

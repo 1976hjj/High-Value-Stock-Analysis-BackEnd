@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import date
 import logging
 import math
+from .bank_statistics import write_disclosures
 
 logger = logging.getLogger("bank_valuation.akshare")
 
@@ -46,6 +47,7 @@ def fetch_bank_special_metrics(code: str, as_of: date) -> BankSpecialMetrics | N
         if not required.issubset(frame.columns):
             logger.warning("Bank special metrics unavailable: code=%s reason=missing report dates", code)
             return None
+        write_disclosures(code, finance=frame.to_dict(orient='records'))
         frame["NOTICE_DATE"] = frame["NOTICE_DATE"].astype("datetime64[ns]")
         frame["REPORT_DATE"] = frame["REPORT_DATE"].astype("datetime64[ns]")
         valid = frame[frame["NOTICE_DATE"].dt.date <= as_of].copy()
@@ -58,7 +60,7 @@ def fetch_bank_special_metrics(code: str, as_of: date) -> BankSpecialMetrics | N
             raw = row.get(field)
             try:
                 value = float(raw)
-                return value / 100 if value >= 0 else None
+                return value / 100 if math.isfinite(value) and value > 0 else None
             except (TypeError, ValueError):
                 return None
         def ratio(numerator_field: str, denominator_field: str) -> float | None:

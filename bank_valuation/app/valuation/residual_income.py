@@ -19,12 +19,15 @@ def intrinsic_value(
     pv_residual_income = 0.0
     for year in range(1, years + 1):
         # A linear mean-reversion keeps the projection from extrapolating ROE forever.
-        projected_roe = roe + (long_term_growth - roe) * (year - 1) / max(years, 1)
+        projected_roe = roe + (cost_of_equity - roe) * (year - 1) / years
         residual_income = (projected_roe - cost_of_equity) * book_value
         pv_residual_income += residual_income / (1 + cost_of_equity) ** year
         book_value *= 1 + projected_roe * (1 - payout_ratio)
 
-    terminal_roe = long_term_growth
+    # In competitive equilibrium ROE converges to the cost of equity, not the
+    # book-value growth rate. Mixing the two created a permanent negative
+    # residual income that almost cancelled the starting book value.
+    terminal_roe = cost_of_equity
     terminal_residual_income = (terminal_roe - cost_of_equity) * book_value
     terminal_value = terminal_residual_income / (cost_of_equity - long_term_growth)
     return max(0.0, current_book_value + pv_residual_income + terminal_value / (1 + cost_of_equity) ** years)

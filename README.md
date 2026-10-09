@@ -4,12 +4,33 @@ FastAPI 银行股估值分析服务，输出估值区间、情景概率、蒙特
 
 ## 启动
 
+在后端目录一键启动前后端（前端项目放在同级目录 `High-Value-Stock-Analysis-FrontEnd`）：
+
 ```powershell
-pip install -r requirements.txt
-uvicorn bank_valuation.app.main:app --reload
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1
+```
+
+脚本会强制结束占用 `8000` 和 `5173` 端口的进程及其子进程，然后在后台启动两个项目并验证接口代理。前端地址为 `http://127.0.0.1:5173`，后端 API 文档为 `http://127.0.0.1:8000/docs`。重复运行即可重启，启动日志保存在 `logs/run/` 下。
+
+脚本使用现有的 `.venv` 和前端 `node_modules`。首次安装或缺少依赖时，先在后端执行 `.\.venv\Scripts\python.exe -m pip install -r requirements.txt`，在前端执行 `.\install.cmd`。
+
+单独启动后端：
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn bank_valuation.app.main:app --reload
 ```
 
 打开 `http://127.0.0.1:8000/docs` 查看并调试 API。
+
+## 数据同步与本地浏览
+
+左侧「数据同步」集中展示 8 个行业的本地数据覆盖，以及行情日期、财报报告期、银行监管指标和历史分红日期。银行范围包含排序、同行基准及回测使用的全部 42 家银行，其他行业使用核心股票池。
+
+页面切换和分析 API 默认只读本地缓存，缓存过期不会触发联网刷新；实时行情轮询已暂停。缺少数据时，先在数据同步页勾选行业及数据类型，点击「同步所选」或「同步所有数据」。同步任务在独立进程中串行执行，页面保持可用；可立即暂停，并继续未完成任务或重试失败项。已有缓存不会因同步失败而被清空。
+
+行情/复权日线同步完整可用历史；财务和银行监管指标同步指定日期前已公告的最新报告。历史分红展示最近除息日期，财报展示报告期，均不同于缓存更新时间。「已缓存」表示本地存在数据，最新日期以各行业及公司明细为准。行业研究先验、模型参数和情景假设随代码版本维护。
+
+同步接口：`GET /api/data-sync/status`（只检查本地文件）、`POST /api/data-sync/start`（`industry_ids`、`dataset_ids`、可选 `target_date`；`resume=true` 继续上次未完成任务）、`POST /api/data-sync/pause`。进度及日志保存于 `output/data_sync/`，重启服务不会自动继续联网拉取。
 
 ## 简洁 API
 

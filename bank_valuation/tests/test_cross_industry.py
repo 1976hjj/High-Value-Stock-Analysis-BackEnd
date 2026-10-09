@@ -317,7 +317,7 @@ def test_dividend_yield_uses_implemented_latest_fiscal_year_cash_once():
     )
 
     assert len(item.dividends) == 1
-    assert cross._trailing_dividend_yield(item, day) == pytest.approx(0.02)
+    assert cross._annual_dividend_yield(item, day) == pytest.approx(0.02)
     assert cross._cash_dividend_on_day(item.dividends, day) == pytest.approx(0.5)
 
 
@@ -336,10 +336,10 @@ def test_dividend_yield_does_not_mix_cash_from_two_fiscal_years():
         dividend_data_available=True,
     )
 
-    assert cross._trailing_dividend_yield(item, day) == pytest.approx(2.016 / 40.16)
+    assert cross._annual_dividend_yield(item, day) == pytest.approx(2.016 / 40.16)
 
 
-def test_trailing_dividend_yield_returns_none_when_source_is_unavailable():
+def test_annual_dividend_yield_returns_none_when_source_is_unavailable():
     profile = profiles_for_industries(["oilgas"])[0]
     day = date(2026, 7, 10)
     item = cross.CrossBacktestData(
@@ -350,7 +350,79 @@ def test_trailing_dividend_yield_returns_none_when_source_is_unavailable():
         dividend_data_available=False,
     )
 
-    assert cross._trailing_dividend_yield(item, day) is None
+    assert cross._annual_dividend_yield(item, day) is None
+
+
+def _pingan_dividend_case():
+    day = date(2026, 9, 30)
+    market = {day - timedelta(days=index): SecurityMarketPoint(close=11.57, pb=.48, pe=5.43)
+              for index in range(90)}
+    return cross.CrossBacktestData(
+        profile=profiles_for_industries(['bank'])[0], market=market, raw_market=market,
+        dividends=[
+            cross.DividendEvent(date(2024, 12, 31), date(2025, 3, 1), date(2025, 7, 1), .4),
+            cross.DividendEvent(date(2025, 6, 30), date(2025, 8, 23), date(2025, 10, 15), .236),
+            cross.DividendEvent(date(2025, 12, 31), date(2026, 3, 21), date(2026, 6, 12), .36),
+            cross.DividendEvent(date(2026, 6, 30), date(2026, 8, 15), date(2026, 9, 24), .249),
+        ], dividend_data_available=True)
+
+
+def test_cross_interim_never_replaces_completed_annual_dividend():
+    item = _pingan_dividend_case()
+    assert cross._annual_dividend_yield(item, date(2026, 9, 30)) == pytest.approx(.596 / 11.57)
+    assert cross._annual_dividend_yield(item, date(2026, 8, 20)) == pytest.approx(.596 / 11.57)
+
+
+@pytest.mark.parametrize('minimum,expected_count', [(.05, 1), (.06, 0)])
+def test_cross_ranking_threshold_uses_annual_not_interim_or_paid_ttm(minimum, expected_count):
+    item = _pingan_dividend_case()
+    query = CrossIndustryStrategyBacktestQuery(industry_ids=['bank', 'telecom'], universe_mode='selected',
+        min_dividend_yield=minimum, min_dividend_safety=0, min_stable_growth=0, max_risk_score=100,
+        max_industry_weight=.45)
+    candidates = cross._rank_candidates('income_core', {item.profile.code: item}, date(2026, 9, 30), query)
+    assert len(candidates) == expected_count
+    if candidates:
+        assert candidates[0].dividend_yield == pytest.approx(.596 / 11.57)
+
+
+def test_cross_waits_for_annual_implementation_and_excludes_future_announcements():
+    item = _pingan_dividend_case()
+    old_day = date(2026, 5, 1)
+    market = {old_day: SecurityMarketPoint(close=11.57, pb=.48, pe=5.43)}
+    future = cross.DividendEvent(date(2026, 12, 31), date(2027, 3, 1), old_day, 9)
+    item = replace(item, market=market, raw_market=market, dividends=[*item.dividends, future])
+    assert cross._annual_dividend_yield(item, old_day) == pytest.approx(.4 / 11.57)
+
+
+def test_cross_zero_year_survives_history_loading_and_does_not_revive_old_cash(monkeypatch):
+    profile = profiles_for_industries(['bank'])[0]
+    events = [cross.DividendEvent(date(2024, 12, 31), date(2025, 3, 1), date(2025, 7, 1), .4),
+              cross.DividendEvent(date(2025, 12, 31), date(2026, 3, 31), None, 0)]
+    monkeypatch.setattr(cross, '_read_dividend_events', lambda code: events)
+    histories, failures = cross._load_dividend_histories([profile], refresh_cache=False)
+    assert not failures
+    assert len(histories[profile.code]) == 2
+    day = date(2026, 9, 30)
+    market = {day: SecurityMarketPoint(close=10, pb=1, pe=8)}
+    item = cross.CrossBacktestData(profile, market, market, histories[profile.code], True)
+    assert cross._annual_dividend_yield(item, day) == 0
+
+
+def test_cross_keeps_stock_bonus_and_adjusts_completed_year_to_current_shares():
+    item = _pingan_dividend_case()
+    events = [cross.DividendEvent(date(2025, 12, 31), date(2026, 3, 1), date(2026, 6, 1), .27),
+              cross.DividendEvent(date(2026, 6, 30), date(2026, 8, 1), date(2026, 9, 1), 0, 1)]
+    events = cross._deduplicate_dividend_events(events + events)
+    assert len(events) == 2
+    item = replace(item, dividends=events)
+    assert cross._annual_dividend_yield(item, date(2026, 9, 30)) == pytest.approx(.27 / 1.1 / 11.57)
+    assert cross._cash_dividend_on_day(events, date(2026, 6, 1)) == pytest.approx(.27)
+
+
+def test_cross_interim_only_is_unknown_instead_of_a_full_year():
+    item = _pingan_dividend_case()
+    item = replace(item, dividends=[item.dividends[-1]])
+    assert cross._annual_dividend_yield(item, date(2026, 9, 30)) is None
 
 
 def test_cross_industry_engine_respects_selected_industries_and_cap(monkeypatch):

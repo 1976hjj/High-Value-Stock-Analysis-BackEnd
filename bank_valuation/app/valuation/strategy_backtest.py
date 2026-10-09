@@ -10,6 +10,7 @@ import math
 import statistics
 
 from ..data_sources.bank_base import BANK_NAMES, _akshare_symbol, _coerce_date, _coerce_positive_float, _market_path
+from ..data_sources.access_policy import require_network
 from ..models import (
     BacktestHolding,
     BacktestHoldingPriceSeries,
@@ -57,6 +58,7 @@ class DividendEvent:
     announcement_date: date
     ex_dividend_date: date | None
     cash_per_share: float
+    bonus_per_ten: float = 0.0
 
 
 @dataclass
@@ -137,9 +139,12 @@ def run_strategy_backtest(query: StrategyBacktestQuery) -> StrategyBacktestRespo
         start_date=dates[0],
         end_date=dates[-1],
         strategy_count=len(results),
-        benchmark_note="银行股等权价格基准：使用本地银行股日线缓存按每日可用涨跌幅等权滚动，不含股息和交易成本。",
+        benchmark_note="银行股等权价格基准：使用本地日线按每日涨跌幅等权滚动，送转股按新增股数调整，不含现金股息和交易成本。",
         data_note=(
-            "v1 回测使用本地缓存中的日线价格/PB历史，股息收益按当前每股分红折算为日度收益；"
+            "v1 回测使用本地缓存中的日线价格/PB历史；股息筛选和评分使用当日已公告、"
+            "已实施的最近完整财年中期+末期分红 / 当日股价，收益按实际除息事件计入，"
+            "不按年度股息率重复加收益。"
+            "送转股在已公告除权日增加股数，避免把机械除权降价误计为亏损。"
             "财务质量、资产质量和资本风险使用最近已披露快照做过滤。它适合先比较策略框架，"
             "严格无未来函数版本需要补齐历史财报公告日、历史分红和历史监管指标。"
         ),
@@ -164,8 +169,14 @@ def _load_backtest_data() -> dict[str, BankBacktestData]:
 
 
 def _read_dividend_events(code: str) -> list[DividendEvent]:
+    from ..data_sources.bank_statistics import disclosure_overrides, day
     cached = _read_dividend_events_cache(code)
     if cached is not None:
+        for item in disclosure_overrides(code, date.today()):
+            if 'annual_dividend_per_share' in item:
+                marker = day(item['report_date'])
+                if not any(event.report_date == marker and event.cash_per_share == item['annual_dividend_per_share'] for event in cached):
+                    cached.append(DividendEvent(marker, day(item['published_date']), None, item['annual_dividend_per_share']))
         return cached
     events = _fetch_dividend_events(code)
     if events:
@@ -190,8 +201,8 @@ def _read_dividend_events_cache(code: str) -> list[DividendEvent] | None:
                 announcement_date = date.fromisoformat(row["announcement_date"])
                 ex_dividend_date = _coerce_date(row.get("ex_dividend_date"))
                 cash_per_share = float(row["cash_per_share"])
-                if cash_per_share > 0:
-                    events.append(DividendEvent(report_date, announcement_date, ex_dividend_date, cash_per_share))
+                if cash_per_share >= 0:
+                    events.append(DividendEvent(report_date, announcement_date, ex_dividend_date, cash_per_share, float(row.get('bonus_per_ten') or 0)))
     except (OSError, KeyError, ValueError):
         return None
     return sorted(events, key=lambda event: (event.announcement_date, event.report_date))
@@ -200,8 +211,9 @@ def _read_dividend_events_cache(code: str) -> list[DividendEvent] | None:
 def _write_dividend_events_cache(code: str, events: list[DividendEvent]) -> None:
     path = _dividend_events_path(code)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=["report_date", "announcement_date", "ex_dividend_date", "cash_per_share"])
+    temporary = path.with_suffix('.tmp')
+    with temporary.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=["report_date", "announcement_date", "ex_dividend_date", "cash_per_share", "bonus_per_ten"])
         writer.writeheader()
         writer.writerows(
             {
@@ -209,12 +221,16 @@ def _write_dividend_events_cache(code: str, events: list[DividendEvent]) -> None
                 "announcement_date": event.announcement_date.isoformat(),
                 "ex_dividend_date": event.ex_dividend_date.isoformat() if event.ex_dividend_date else "",
                 "cash_per_share": event.cash_per_share,
+                "bonus_per_ten": event.bonus_per_ten,
             }
             for event in sorted(events, key=lambda item: (item.announcement_date, item.report_date))
         )
+    temporary.replace(path)
 
 
 def _fetch_dividend_events(code: str) -> list[DividendEvent]:
+    require_network()
+    from ..data_sources.bank_statistics import dividend_records, write_disclosures
     try:
         import akshare as ak
 
@@ -222,32 +238,12 @@ def _fetch_dividend_events(code: str) -> list[DividendEvent]:
             frame = ak.stock_fhps_detail_em(symbol=_akshare_symbol(code))
     except Exception:
         return []
-    if frame is None or frame.empty or len(frame.columns) < 17:
+    if frame is None or frame.empty:
         return []
-
-    report_col, announcement_col, cash_col, ex_date_col = frame.columns[0], frame.columns[1], frame.columns[5], frame.columns[16]
-    events: list[DividendEvent] = []
-    seen: set[tuple[date, date | None, float]] = set()
-    for _, row in frame.iterrows():
-        report_date = _coerce_date(row.get(report_col))
-        announcement_date = _coerce_date(row.get(announcement_col))
-        ex_dividend_date = _coerce_date(row.get(ex_date_col))
-        cash_per_10 = _coerce_positive_float(row.get(cash_col))
-        if report_date is None or announcement_date is None or cash_per_10 <= 0:
-            continue
-        cash_per_share = cash_per_10 / 10
-        event_key = (report_date, ex_dividend_date, round(cash_per_share, 8))
-        if event_key in seen:
-            continue
-        seen.add(event_key)
-        events.append(
-            DividendEvent(
-                report_date=report_date,
-                announcement_date=announcement_date,
-                ex_dividend_date=ex_dividend_date,
-                cash_per_share=cash_per_share,
-            )
-        )
+    rows = frame.to_dict(orient='records')
+    write_disclosures(code, dividends=rows)
+    events = [DividendEvent(row['report_date'], row['announcement_date'], row['ex_dividend_date'],
+                            row['cash_per_share'], row['bonus_per_ten']) for row in dividend_records(rows)]
     return sorted(events, key=lambda event: (event.announcement_date, event.report_date))
 
 
@@ -285,7 +281,7 @@ def _bank_equal_weight_benchmark(
                 continue
             previous = previous_prices.get(code)
             if previous is not None and previous > 0:
-                daily_returns.append(point.close / previous - 1)
+                daily_returns.append(point.close * _share_distribution_factor_on_day(item, day) / previous - 1)
             previous_prices[code] = point.close
         if daily_returns:
             value *= 1 + sum(daily_returns) / len(daily_returns)
@@ -343,7 +339,8 @@ def _run_one_strategy(
                 asset_returns[code] = 0.0
                 continue
             previous = previous_prices.get(code, point.close)
-            price_return = point.close / previous - 1 if previous > 0 else 0.0
+            share_factor = _share_distribution_factor_on_day(data[code], day)
+            price_return = point.close * share_factor / previous - 1 if previous > 0 else 0.0
             dividend_cash = _cash_dividend_on_day(data[code], day)
             dividend_return = dividend_cash / previous if previous > 0 else 0.0
             total_asset_return = price_return + dividend_return
@@ -833,17 +830,13 @@ def _latest_implemented_fiscal_year_dividend(
     events: list[DividendEvent], day: date
 ) -> float | None:
     """Sum paid dividends for the latest fiscal year available on ``day``."""
-    yearly_cash: dict[int, float] = {}
-    for event in _deduplicate_implemented_dividends(events):
-        if (
-            event.ex_dividend_date is not None
-            and event.ex_dividend_date <= day
-            and event.announcement_date <= day
-        ):
-            yearly_cash[event.report_date.year] = yearly_cash.get(event.report_date.year, 0.0) + event.cash_per_share
-    if not yearly_cash:
-        return None
-    return yearly_cash[max(yearly_cash)]
+    from ..data_sources.bank_statistics import dividend_records, dividend_summary
+    rows = [{'report_date': event.report_date, 'announcement_date': event.announcement_date,
+             'ex_dividend_date': event.ex_dividend_date, 'cash_per_share': event.cash_per_share,
+             'bonus_per_ten': event.bonus_per_ten} for event in events
+            if event.announcement_date <= day and (event.cash_per_share == 0
+                or (event.ex_dividend_date is not None and event.ex_dividend_date <= day))]
+    return dividend_summary(dividend_records(rows), day)['annual']
 
 
 def _cash_dividend_on_day(item: BankBacktestData, day: date) -> float:
@@ -852,6 +845,12 @@ def _cash_dividend_on_day(item: BankBacktestData, day: date) -> float:
         for event in _deduplicate_implemented_dividends(item.dividends)
         if event.ex_dividend_date == day and event.announcement_date <= day
     )
+
+
+def _share_distribution_factor_on_day(item: BankBacktestData, day: date) -> float:
+    bonuses = {event.bonus_per_ten for event in item.dividends
+               if event.ex_dividend_date == day and event.announcement_date <= day and event.bonus_per_ten > 0}
+    return math.prod(1 + bonus / 10 for bonus in bonuses)
 
 
 def _pb_percentile(market: dict[date, MarketPoint], day: date, current_pb: float, years: int) -> float:

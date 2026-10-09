@@ -22,6 +22,20 @@ class BankInput(BaseModel):
     dividend_per_share: float = Field(ge=0)
     payout_ratio: float = Field(ge=0, le=1.5)
     dividend_yield: float = Field(ge=0, le=2)
+    dividend_fiscal_year: int | None = None
+    dividend_basis: str | None = None
+    dividend_cash_ttm: float | None = None
+    dividend_yield_ttm: float | None = None
+    dividend_annual_eps: float | None = None
+    payout_basis: str | None = None
+    eps_basis: str | None = None
+    roe_reported: float | None = None
+    roe_basis: str | None = None
+    financial_published_date: date | None = None
+    financial_metrics_source: str | None = None
+    trend_comparison_date: date | None = None
+    statistics_version: int = 0
+    data_quality_notes: list[str] = Field(default_factory=list)
     pb_current: float = Field(gt=0)
     pe_current: float | None = Field(default=None, gt=0)
     pb_history: list[float] = Field(min_length=1)
@@ -47,11 +61,11 @@ class BankInput(BaseModel):
     pb_history_dates: list[date] = Field(default_factory=list)
     price_history: list[float] = Field(default_factory=list)
     # Optional trend fields let callers enrich risk analysis without changing core inputs.
-    roe_trend: float = 0.0
-    nim_change: float = 0.0
-    npl_ratio_change: float = 0.0
-    provision_coverage_change: float = 0.0
-    dividend_stable: bool = True
+    roe_trend: float | None = None
+    nim_change: float | None = None
+    npl_ratio_change: float | None = None
+    provision_coverage_change: float | None = None
+    dividend_stable: bool | None = None
 
     @field_validator("pb_history")
     @classmethod
@@ -212,6 +226,14 @@ class BankMeanReversionRow(BaseModel):
     upside_potential: float
     margin_of_safety: float
     dividend_yield: float
+    dividend_fiscal_year: int | None = None
+    dividend_per_share: float | None = None
+    dividend_yield_ttm: float | None = None
+    dividend_cash_ttm: float | None = None
+    payout_ratio: float | None = None
+    financial_report_date: date | None = None
+    roe_basis: str | None = None
+    data_quality_notes: list[str] = Field(default_factory=list)
     roe: float
     profit_growth_yoy: float
     npl_ratio: float | None = None

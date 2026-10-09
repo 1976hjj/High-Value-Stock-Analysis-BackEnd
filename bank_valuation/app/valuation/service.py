@@ -218,7 +218,7 @@ def _positive_median(values: list[float | None]) -> float:
 
 def _snapshot(bank: BankInput) -> dict[str, float | str | bool | None]:
     """Auditable inputs used for the current valuation run."""
-    return {
+    snapshot = {
         "daily_change_pct": bank.daily_change_pct, "bps": bank.bps, "eps": bank.eps, "roe": bank.roe, "net_profit": bank.net_profit,
         "profit_growth_yoy": bank.profit_growth_yoy, "dividend_per_share": bank.dividend_per_share,
         "payout_ratio": bank.payout_ratio, "dividend_yield": bank.dividend_yield,
@@ -230,6 +230,13 @@ def _snapshot(bank: BankInput) -> dict[str, float | str | bool | None]:
         "nim_change": bank.nim_change, "npl_ratio_change": bank.npl_ratio_change,
         "provision_coverage_change": bank.provision_coverage_change, "dividend_stable": bank.dividend_stable,
     }
+    for field in ('dividend_fiscal_year', 'dividend_basis', 'dividend_cash_ttm', 'dividend_yield_ttm',
+                  'dividend_annual_eps', 'payout_basis', 'eps_basis', 'roe_reported', 'roe_basis',
+                  'financial_metrics_source', 'financial_published_date', 'trend_comparison_date', 'statistics_version'):
+        value = getattr(bank, field)
+        snapshot[field] = str(value) if hasattr(value, 'isoformat') else value
+    snapshot['data_quality_note'] = '；'.join(bank.data_quality_notes)
+    return snapshot
 
 
 def _sample_pb_history(bank: BankInput, max_points: int = 120) -> list[dict[str, float | str | None]]:
